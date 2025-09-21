@@ -1,0 +1,32 @@
+Starting Isolated Shot 169501 Visualization Analysis...
+======================================================================
+IMPORTANT: Shot 169501 will be EXCLUDED from training data
+======================================================================
+Loading plasma data...
+Trying to load from: ../plasma_data.csv
+Successfully loaded data from: ../plasma_data.csv
+Loaded 226618 rows
+Excluding shot 169501 from training data...
+Training data: 203717 rows (excluding shot 169501)
+Target shot data: 4330 rows (shot 169501)
+Training Random Forest model on data excluding target shot...
+Traceback (most recent call last):
+  File "Isolated_Shot_169501_Visualization.py", line 439, in <module>
+    shot_data = main()
+  File "Isolated_Shot_169501_Visualization.py", line 399, in main
+    clf, selected_features, df_cleaned, df_target_shot = load_and_train_model_excluding_shot(SHOT_NUMBER)
+  File "Isolated_Shot_169501_Visualization.py", line 109, in load_and_train_model_excluding_shot
+    clf.fit(X_train_split, y_train_split)
+  File "/mnt/homes/sr4240/.local/lib/python3.8/site-packages/sklearn/base.py", line 1152, in wrapper
+    return fit_method(estimator, *args, **kwargs)
+  File "/mnt/homes/sr4240/.local/lib/python3.8/site-packages/sklearn/ensemble/_forest.py", line 456, in fit
+    trees = Parallel(
+  File "/mnt/homes/sr4240/.local/lib/python3.8/site-packages/sklearn/utils/parallel.py", line 65, in __call__
+    return super().__call__(iterable_with_config)
+  File "/mnt/homes/sr4240/.local/lib/python3.8/site-packages/joblib/parallel.py", line 2007, in __call__
+    return output if self.return_generator else list(output)
+  File "/mnt/homes/sr4240/.local/lib/python3.8/site-packages/joblib/parallel.py", line 1650, in _get_outputs
+    yield from self._retrieve()
+  File "/mnt/homes/sr4240/.local/lib/python3.8/site-packages/joblib/parallel.py", line 1762, in _retrieve
+    time.sleep(0.01)
+KeyboardInterrupt
