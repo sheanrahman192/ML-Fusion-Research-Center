@@ -410,7 +410,7 @@ def create_windows_for_specific_shots(
     return all_windows, all_labels, all_window_shots
 
 
-def train_model(model, train_loader, val_loader, device, n_epochs=50):
+def train_model(model, train_loader, val_loader, device, n_epochs=7):
     """Train the model"""
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -694,7 +694,7 @@ def main():
 
     print("\nStarting training...")
     train_losses, val_losses, train_accs, val_accs = train_model(
-        model, train_loader, val_loader, device, n_epochs=50
+        model, train_loader, val_loader, device, n_epochs=7
     )
 
     print("\nLoading best model...")

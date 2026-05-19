@@ -5,6 +5,7 @@ When both databases have the same shot number, data from plasma_data.csv takes p
 """
 
 import pandas as pd
+import numpy as np
 import argparse
 from pathlib import Path
 
@@ -80,13 +81,23 @@ def combine_databases(
     # Combine: all of plasma_data + unique rows from label_propagated
     df_combined = pd.concat([df_plasma, df_label_unique], ignore_index=True)
     
-    # Merge predicted_state into state column where state is missing
-    if 'predicted_state' in df_combined.columns and 'state' in df_combined.columns:
-        df_combined['state'] = df_combined['state'].fillna(df_combined['predicted_state'])
-        print(f"  Filled {df_combined['predicted_state'].notna().sum() - df_plasma['state'].notna().sum():,} missing 'state' values from 'predicted_state'")
-    elif 'predicted_state' in df_combined.columns and 'state' not in df_combined.columns:
-        df_combined['state'] = df_combined['predicted_state']
-        print(f"  Created 'state' column from 'predicted_state'")
+    # Merge state_binary (predicted by propagate_labels_binary.py) into state_binary column where missing
+    if 'state_binary' in df_label.columns:
+        n_missing_before = df_combined['state_binary'].isna().sum() if 'state_binary' in df_combined.columns else len(df_combined)
+        if 'state_binary' not in df_combined.columns:
+            df_combined['state_binary'] = np.nan
+        # Build a (shot,time)-keyed map of propagated labels and fill where state_binary is NaN
+        prop = df_label.set_index(['shot', 'time'])['state_binary']
+        idx = pd.MultiIndex.from_arrays([df_combined['shot'].values, df_combined['time'].values])
+        propagated = prop.reindex(idx).values
+        # Treat -1 (uncertain) from propagation as still-unknown
+        propagated = pd.Series(propagated)
+        propagated = propagated.where(propagated != -1, np.nan)
+        df_combined['state_binary'] = df_combined['state_binary'].fillna(pd.Series(propagated.values, index=df_combined.index))
+        n_missing_after = df_combined['state_binary'].isna().sum()
+        print(f"  Filled {n_missing_before - n_missing_after:,} missing 'state_binary' values from propagated labels")
+    else:
+        print("  WARNING: LABEL_PROPAGATED_DATABASE.csv has no 'state_binary' column — run propagate_labels_binary.py first.")
     
     # Sort by shot and time for consistency
     df_combined = df_combined.sort_values(['shot', 'time']).reset_index(drop=True)

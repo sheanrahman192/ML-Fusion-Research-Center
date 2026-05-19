@@ -14,10 +14,10 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Set random seeds for reproducibility
-np.random.seed(43)
-torch.manual_seed(43)
+np.random.seed(42)
+torch.manual_seed(42)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(43)
+    torch.cuda.manual_seed(42)
 
 class LSTMFirstNN(nn.Module):
     """
@@ -25,7 +25,7 @@ class LSTMFirstNN(nn.Module):
     followed by NN layers (for feature transformation).
     This avoids the slow loop while preserving temporal structure.
     """
-    def __init__(self, n_features, n_classes=4, lstm_hidden=128, nn_hidden_sizes=[256, 128]):
+    def __init__(self, n_features, n_classes=2, lstm_hidden=128, nn_hidden_sizes=[256, 128]):
         super(LSTMFirstNN, self).__init__()
 
         # LSTM processes the raw temporal data FIRST
@@ -83,7 +83,7 @@ class LSTMFirstNN(nn.Module):
         classifier_params = sum(p.numel() for name, p in self.named_parameters() if 'classifier' in name)
 
         print(f"\n{'='*60}")
-        print(f"LSTM-First-NN Model Parameter Count:")
+        print(f"LSTM-First-NN Model Parameter Count (Binary):")
         print(f"{'='*60}")
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
@@ -139,132 +139,200 @@ class PlasmaDataset(Dataset):
         return self.windows[idx].T, self.labels[idx]
 
 def load_and_prepare_data():
-    """Load and preprocess the plasma data"""
+    """Load and preprocess the plasma data for binary classification.
+
+    Multi-class state convention (matches BiLSTM_NN_Center_Point_Shot_Split.py):
+        0 = Suppressed
+        1 = Dithering
+        2 = Mitigated
+        3 = ELMing
+       -1 = Unclassified edge/short (filled here by per-shot label padding).
+
+    -1 occurs because the upstream label-propagation pipeline left some shot
+    edges unlabelled. We treat -1 as missing and fill it with the nearest
+    valid state within the same shot (forward-fill then back-fill on time-
+    sorted rows). After this, every retained row has state in {0, 1, 2, 3}.
+
+    Binary mapping applied below:
+        state == 0          -> 0 (Suppressed)
+        state in {1, 2, 3}  -> 1 (ELMy = Dithering + Mitigated + ELMing)
+    """
     print("Loading data...")
     df = pd.read_csv('/mnt/homes/sr4240/my_folder/plasma_data.csv')
 
-    # Remove problematic shot
+    # Remove problematic shot (matches the multi-class script).
     df = df[df['shot'] != 191675].copy()
 
-    # Select only the specified 7 features
-    important_features = ['iln3iamp', 'betan', 'density', 'li', 'tritop', 'fs_sum_max_smoothed']
+    important_features = ['iln3iamp', 'betan', 'density', 'li',
+                         'tritop', 'fs_sum_max_smoothed']
     selected_features = [f for f in important_features if f in df.columns]
-
     print(f"Using {len(selected_features)} features: {selected_features}")
 
-    # Sort by shot and time
+    # Sort by (shot, time) so per-shot ffill/bfill respects time order.
     df_sorted = df.sort_values(['shot', 'time']).reset_index(drop=True)
 
-    # Valid labels are already 0-indexed:
-    # 0=Suppressed, 1=Dithering, 2=Mitigated, 3=ELMing. Exclude unknown values like -1.
-    valid_states = [0, 1, 2, 3]
-    df_filtered = df_sorted[df_sorted['state'].isin(valid_states)].copy()
+    pre_dist = Counter(df_sorted['state'].values.tolist())
+    n_unknown_pre = int((df_sorted['state'] == -1).sum())
+    print(f"Raw state distribution (incl. -1 edges): {pre_dist}")
+    print(f"  Unknown (-1) frames before padding: {n_unknown_pre:,}")
 
-    # Extract features and labels
+    # Label "padding": replace -1 with the nearest valid state within each
+    # shot using forward-fill then back-fill. This mirrors the edge-replicate
+    # padding already used for the *features* and eliminates the -1 frames
+    # that exist because labels weren't propagated all the way to shot edges.
+    state_as_float = df_sorted['state'].replace(-1, np.nan)
+    df_sorted = df_sorted.assign(state=state_as_float)
+    df_sorted['state'] = (
+        df_sorted.groupby('shot', group_keys=False)['state']
+                 .transform(lambda s: s.ffill().bfill())
+    )
+
+    n_remaining_unknown = int(df_sorted['state'].isna().sum())
+    n_filled = n_unknown_pre - n_remaining_unknown
+    print(f"  -1 frames filled by per-shot label padding: {n_filled:,}")
+    if n_remaining_unknown:
+        print(
+            f"  -1 frames remaining (entire-shot unlabelled, dropped): "
+            f"{n_remaining_unknown:,}"
+        )
+
+    df_filtered = df_sorted.dropna(subset=['state']).copy()
+    df_filtered['state'] = df_filtered['state'].astype(int)
+
     X = df_filtered[selected_features].values
-    y = df_filtered['state'].values
+    y = df_filtered['state'].values.astype(int)
     shots = df_filtered['shot'].values
 
-    # Remove NaN values
-    valid_mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+    valid_mask = ~np.isnan(X).any(axis=1)
     X = X[valid_mask]
     y = y[valid_mask]
     shots = shots[valid_mask]
 
-    y = y.astype(int)
-
     print(f"Data shape after cleaning: {X.shape}")
-    print(f"Label distribution: {Counter(y)}")
+    print(f"Multi-class label distribution after padding: {Counter(y.tolist())}")
 
-    # Standardize features
+    # Binary remap: 0 -> 0 (Suppressed); 1, 2, 3 -> 1 (ELMy).
+    y_binary = np.where(y == 0, 0, 1).astype(np.int64)
+    print(f"Binary label distribution (0=Suppressed, 1=ELMy): {Counter(y_binary.tolist())}")
+
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    return X_scaled, y, shots, selected_features, scaler
+    return X_scaled, y_binary, shots, selected_features, scaler
 
-def create_windows_for_shots(X, y, shots, shot_list, window_size=150):
-    """Create windows for a specific list of shots"""
-    windows, labels = [], []
+
+def edge_pad_shot_features(X_sub, window_size):
+    """
+    Replicate first/last rows so every original timestep can be the center of a length-window_size window.
+    Returns X_pad (L + window_size - 1, n_features) with original rows in the middle segment.
+    """
+    X_sub = np.asarray(X_sub, dtype=np.float64)
+    L, n_feat = X_sub.shape
+    center_idx = window_size // 2
+    pad_left = center_idx
+    pad_right = window_size - center_idx - 1
+    if L == 0:
+        return X_sub, pad_left
+    left = np.repeat(X_sub[:1], pad_left, axis=0)
+    right = np.repeat(X_sub[-1:], pad_right, axis=0)
+    X_pad = np.vstack([left, X_sub, right])
+    return X_pad.astype(np.float32), pad_left
+
+
+def create_windows_with_shot_split(X, y, shots, window_size=150, train_frac=0.7, val_frac=0.15):
+    """Create windows (edge-padded per shot) and split by shot: all windows from a shot share the same fold."""
+    print(f"Creating windows of size {window_size} (edge replicate padding)...")
+    print(f"Train/val/test split by shot: {train_frac:.0%} / {val_frac:.0%} / {1 - train_frac - val_frac:.0%}")
+
+    windows, labels, window_shots = [], [], []
     center_idx = window_size // 2
 
-    for shot_id in shot_list:
+    # Create windows per shot
+    for shot_id in np.unique(shots):
         shot_mask = shots == shot_id
         shot_indices = np.where(shot_mask)[0]
 
-        if len(shot_indices) < window_size:
+        if len(shot_indices) == 0:
             continue
 
-        for i in range(len(shot_indices) - window_size + 1):
-            start = shot_indices[i]
-            end = start + window_size
+        X_sub = X[shot_indices]
+        y_sub = y[shot_indices]
+        L = len(shot_indices)
 
-            if end > shot_indices[-1] + 1:
-                break
+        if L < window_size:
+            # Pad short shots to length window_size (replicate edges), then edge_pad below
+            pad_extra = window_size - L
+            left_extra = pad_extra // 2
+            right_extra = pad_extra - left_extra
+            first, last = X_sub[:1], X_sub[-1:]
+            X_sub = np.vstack(
+                [np.repeat(first, left_extra, axis=0), X_sub, np.repeat(last, right_extra, axis=0)]
+            )
+            y_sub = np.concatenate(
+                [np.repeat(y_sub[:1], left_extra), y_sub, np.repeat(y_sub[-1:], right_extra)]
+            )
+            L = len(X_sub)
 
-            window = X[start:end]
-            center_label = y[start + center_idx]
+        X_pad, pad_left = edge_pad_shot_features(X_sub, window_size)
 
-            # Check window validity
+        for t in range(L):
+            start = pad_left + t - center_idx
+            window = X_pad[start : start + window_size]
+            center_label = y_sub[t]
+
             if not np.isnan(window).any() and not np.isinf(window).any():
                 windows.append(window)
                 labels.append(center_label)
-
-    if len(windows) == 0:
-        return np.array([]), np.array([])
+                window_shots.append(shot_id)
 
     windows = np.array(windows, dtype=np.float32)
     labels = np.array(labels)
+    window_shots = np.array(window_shots)
 
-    return windows, labels
+    print(f"Created {len(windows)} valid windows")
+    print(f"Label distribution: {Counter(labels)}")
 
-def create_windows_with_shot_split(X, y, shots, window_size=150, train_ratio=0.7, val_ratio=0.15):
-    """Create windows and perform shot-based split"""
-    print(f"Creating windows of size {window_size} with SHOT-BASED split...")
-
-    # Get unique shots
-    unique_shots = np.unique(shots)
+    rng = np.random.RandomState(42)
+    unique_shots = rng.permutation(np.unique(window_shots))
     n_shots = len(unique_shots)
-    print(f"Total number of unique shots: {n_shots}")
 
-    # Shuffle shots for random assignment
-    np.random.seed(42)
-    shuffled_shots = np.random.permutation(unique_shots)
+    train_end = int(train_frac * n_shots)
+    val_end = int((train_frac + val_frac) * n_shots)
 
-    # Calculate split indices
-    train_end = int(train_ratio * n_shots)
-    val_end = int((train_ratio + val_ratio) * n_shots)
+    train_list = unique_shots[:train_end].tolist()
+    val_list = unique_shots[train_end:val_end].tolist()
+    test_list = unique_shots[val_end:].tolist()
 
-    # Split shots into train/val/test
-    train_shots = shuffled_shots[:train_end]
-    val_shots = shuffled_shots[train_end:val_end]
-    test_shots = shuffled_shots[val_end:]
+    # Integer boundaries can leave val empty (e.g. n_shots=3); rebalance when possible.
+    if n_shots >= 3:
+        if len(val_list) == 0 and len(train_list) > 1:
+            val_list.append(train_list.pop())
+        if len(test_list) == 0 and len(val_list) > 1:
+            test_list.append(val_list.pop())
+    elif n_shots == 2:
+        train_list = [unique_shots[0]]
+        val_list = []
+        test_list = [unique_shots[1]]
+    else:
+        train_list = unique_shots.tolist()
+        val_list = []
+        test_list = []
 
-    print(f"\nShot split:")
-    print(f"  Train shots: {len(train_shots)}")
-    print(f"  Val shots: {len(val_shots)}")
-    print(f"  Test shots: {len(test_shots)}")
+    train_shot_set = set(train_list)
+    val_shot_set = set(val_list)
+    test_shot_set = set(test_list)
 
-    # Create windows for each split
-    print("\nCreating windows for each split...")
-    train_windows, train_labels = create_windows_for_shots(X, y, shots, train_shots, window_size)
-    val_windows, val_labels = create_windows_for_shots(X, y, shots, val_shots, window_size)
-    test_windows, test_labels = create_windows_for_shots(X, y, shots, test_shots, window_size)
+    train_mask = np.isin(window_shots, list(train_shot_set))
+    val_mask = np.isin(window_shots, list(val_shot_set))
+    test_mask = np.isin(window_shots, list(test_shot_set))
 
-    print(f"\nWindows created:")
-    print(f"  Train: {len(train_windows)} windows")
-    print(f"  Val: {len(val_windows)} windows")
-    print(f"  Test: {len(test_windows)} windows")
+    print(f"Shots per split — train: {len(train_shot_set)}, val: {len(val_shot_set)}, test: {len(test_shot_set)} (total unique shots: {n_shots})")
 
-    print(f"\nLabel distributions:")
-    print(f"  Train: {Counter(train_labels)}")
-    print(f"  Val: {Counter(val_labels)}")
-    print(f"  Test: {Counter(test_labels)}")
+    return (windows[train_mask], labels[train_mask],
+            windows[val_mask], labels[val_mask],
+            windows[test_mask], labels[test_mask])
 
-    return (train_windows, train_labels,
-            val_windows, val_labels,
-            test_windows, test_labels)
-
-def train_model(model, train_loader, val_loader, device, n_epochs=50):
+def train_model(model, train_loader, val_loader, device, n_epochs=100):
     """Train the model"""
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
@@ -277,7 +345,7 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
 
     best_val_acc = 0.0
     patience_counter = 0
-    max_patience = 10
+    max_patience = 20
 
     print("\nStarting training...")
     for epoch in range(n_epochs):
@@ -328,7 +396,8 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
         val_acc = accuracy_score(val_labels_list, val_preds)
 
         avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
+        n_val_batches = len(val_loader)
+        avg_val_loss = val_loss / n_val_batches if n_val_batches > 0 else float("nan")
 
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
@@ -337,15 +406,19 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
 
         print(f"Epoch {epoch+1}/{n_epochs}")
         print(f"  Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        print(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        if n_val_batches > 0:
+            print(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        else:
+            print("  Val: skipped (no validation shots)")
 
         # Learning rate scheduling
-        scheduler.step(val_acc)
+        scheduler.step(val_acc if n_val_batches > 0 else train_acc)
 
-        # Early stopping
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_lstm_first_nn_shot_split.pth')
+        # Early stopping (use train acc if no validation fold)
+        monitor_acc = val_acc if n_val_batches > 0 else train_acc
+        if monitor_acc > best_val_acc:
+            best_val_acc = monitor_acc
+            torch.save(model.state_dict(), 'best_lstm_first_nn_binary.pth')
             patience_counter = 0
             print(f"  ✓ New best model saved!")
         else:
@@ -358,7 +431,7 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
     return train_losses, val_losses, train_accs, val_accs
 
 def evaluate_model(model, test_loader, device, class_names):
-    """Evaluate the model on test set"""
+    """Evaluate the model on test set (binary)"""
     model.eval()
 
     all_preds = []
@@ -381,11 +454,11 @@ def evaluate_model(model, test_loader, device, class_names):
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
 
-    # Print classification report
+    # Print classification report (sklearn table format)
     print("\nClassification Report:")
     print(classification_report(all_labels, all_preds, target_names=class_names, digits=4))
 
-    # Calculate ROC AUC for each class
+    # Per-class ROC AUC (one-vs-rest), same layout as multi-class shot-split scripts
     print("\nROC AUC Scores:")
     for i, class_name in enumerate(class_names):
         if i < all_probs.shape[1]:
@@ -396,8 +469,8 @@ def evaluate_model(model, test_loader, device, class_names):
 
     return all_preds, all_labels, all_probs
 
-def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, class_names):
-    """Plot training curves and confusion matrix"""
+def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, all_probs, class_names):
+    """Plot training curves, confusion matrix, and ROC curve"""
 
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
@@ -429,31 +502,40 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[1, 0].set_ylabel('True Label')
     axes[1, 0].set_xlabel('Predicted Label')
 
-    # Plot confusion matrix (counts)
-    cm_counts = confusion_matrix(all_labels, all_preds)
-    sns.heatmap(cm_counts, annot=True, fmt='d', cmap='Blues',
-                xticklabels=class_names, yticklabels=class_names,
-                ax=axes[1, 1])
-    axes[1, 1].set_title('Confusion Matrix (Counts)')
-    axes[1, 1].set_ylabel('True Label')
-    axes[1, 1].set_xlabel('Predicted Label')
+    # Plot ROC curve for the binary classifier (positive class = ELMy)
+    if len(np.unique(all_labels)) > 1:
+        fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+        auc = roc_auc_score(all_labels, all_probs[:, 1])
+        axes[1, 1].plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC (AUC = {auc:.4f})')
+        axes[1, 1].plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--')
+        axes[1, 1].set_xlim([0.0, 1.0])
+        axes[1, 1].set_ylim([0.0, 1.05])
+        axes[1, 1].set_xlabel('False Positive Rate')
+        axes[1, 1].set_ylabel('True Positive Rate')
+        axes[1, 1].set_title('ROC Curve (ELMy vs Suppressed)')
+        axes[1, 1].legend(loc='lower right')
+        axes[1, 1].grid(True, alpha=0.3)
+    else:
+        axes[1, 1].text(0.5, 0.5, 'ROC unavailable\n(only one class in test)',
+                        ha='center', va='center')
+        axes[1, 1].set_axis_off()
 
     plt.tight_layout()
-    plt.savefig('lstm_first_nn_shot_split_results.png', dpi=300, bbox_inches='tight')
+    plt.savefig('lstm_first_nn_binary_results.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    print("Results saved to 'lstm_first_nn_shot_split_results.png'")
+    print("Results saved to 'lstm_first_nn_binary_results.png'")
 
 import time
 
 def main():
-    """Main training pipeline"""
-    print("=" * 60)
-    print("LSTM-First NN Model for Plasma Classification")
-    print("=" * 60)
+    """Main training pipeline for binary classification"""
+    print("=" * 50)
+    print("LSTM-First NN Model for Plasma Binary Classification")
+    print("=" * 50)
+    print("Classes: Suppressed (0) vs ELMy (1)")
     print("Architecture: LSTM processes temporal data → NN transforms features")
-    print("Split Method: SHOT-BASED (no data leakage between train/val/test)")
-    print("=" * 60)
+    print("=" * 50)
 
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -462,7 +544,7 @@ def main():
     # Load data
     X, y, shots, features, scaler = load_and_prepare_data()
 
-    # Create windows and split BY SHOT
+    # Create windows and split
     train_X, train_y, val_X, val_y, test_X, test_y = create_windows_with_shot_split(X, y, shots)
 
     print(f"\nDataset sizes:")
@@ -479,8 +561,8 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
-    # Create model
-    model = LSTMFirstNN(n_features=len(features), n_classes=4).to(device)
+    # Create model (binary classification: 2 classes)
+    model = LSTMFirstNN(n_features=len(features), n_classes=2).to(device)
 
     # Test forward pass speed
     print("\nTesting forward pass speed...")
@@ -504,47 +586,48 @@ def main():
 
     # Load best model
     print("\nLoading best model...")
-    model.load_state_dict(torch.load('best_lstm_first_nn_shot_split.pth'))
+    model.load_state_dict(torch.load('best_lstm_first_nn_binary.pth'))
 
-    # Evaluate on test set
-    class_names = ['Suppressed', 'Dithering', 'Mitigated', 'ELMing']
-    all_preds, all_labels, all_probs = evaluate_model(model, test_loader, device, class_names)
-
-    # Plot results
-    plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, class_names)
-
-    # Final test accuracy
-    test_acc = accuracy_score(all_labels, all_preds)
-    print(f"\nFinal Test Accuracy: {test_acc:.4f}")
+    class_names = ['Suppressed', 'ELMy']
+    if len(test_X) == 0:
+        print("\nNo test windows after shot-level split; skipping test evaluation and plots.")
+        all_preds = all_labels = np.array([])
+        all_probs = np.empty((0, 2))
+        test_acc = float("nan")
+    else:
+        all_preds, all_labels, all_probs = evaluate_model(model, test_loader, device, class_names)
+        plot_results(train_losses, val_losses, train_accs, val_accs,
+                     all_preds, all_labels, all_probs, class_names)
+        test_acc = accuracy_score(all_labels, all_preds)
 
     # Save complete model checkpoint for later use
-    save_path = '/mnt/homes/sr4240/my_folder/BiLSTM_NN_Architecture/bilstm_nn_complete_model.pth'
+    save_path = '/mnt/homes/sr4240/my_folder/BiLSTM_NN_Architecture/bilstm_nn_binary_complete_model.pth'
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'scaler_mean': scaler.mean_,
         'scaler_scale': scaler.scale_,
         'features': features,
         'n_features': len(features),
-        'n_classes': 4,
+        'n_classes': 2,
         'lstm_hidden': 128,
         'nn_hidden_sizes': [256, 128],
         'window_size': 150,
         'class_names': class_names,
-        'test_accuracy': test_acc
+        'label_mapping': {
+            'Suppressed': 0,
+            'ELMy': 1,
+            'source_states': {'Suppressed': [0], 'ELMy': [1, 2, 3]},
+            'unknown_handling': 'per-shot ffill+bfill of state==-1 (label padding)',
+        },
+        'test_accuracy': float(test_acc) if test_acc == test_acc else None
     }
     torch.save(checkpoint, save_path)
     print(f"\n✓ Complete model checkpoint saved to: {save_path}")
     print("  Includes: model weights, scaler, features, label mappings")
 
-    # Also save as best_lstm_first_nn.pth
-    torch.save(checkpoint, 'best_lstm_first_nn.pth')
-    print(f"✓ Also saved to: best_lstm_first_nn.pth")
-
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 50)
     print("Training Complete!")
-    print("Note: Shot-based split ensures no data leakage between splits")
-    print("=" * 60)
+    print("=" * 50)
 
 if __name__ == "__main__":
     main()
-

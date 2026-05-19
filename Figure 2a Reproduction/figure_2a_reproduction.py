@@ -40,19 +40,21 @@ print(f"  density (10^19 m^-3): {df['density_1e19'].min():.2f} - {df['density_1e
 print(f"  Ti (keV): {df['Ti_keV'].min():.2f} - {df['Ti_keV'].max():.2f}")
 print(f"  P_NBI (MW): {df['P_NBI_MW'].min():.2f} - {df['P_NBI_MW'].max():.2f}")
 
+BIN_MS = 200
+
 # Create 200 ms time bins (non-overlapping)
-# Time is in milliseconds, so 200 ms bins
-df['time_bin'] = (df['time'] // 200) * 200
+# Time is in milliseconds, so BIN_MS ms bins
+df['time_bin'] = (df['time'] // BIN_MS) * BIN_MS
 
 # Group by shot and time bin, then average
-print("\nApplying 200 ms time averaging...")
+print(f"\nApplying {BIN_MS} ms time averaging...")
 df_avg = df.groupby(['shot', 'time_bin']).agg({
     'density_1e19': 'mean',
     'Ti_keV': 'mean',
     'P_NBI_MW': 'mean'
 }).reset_index()
 
-print(f"Data points after 200 ms averaging: {len(df_avg)}")
+print(f"Data points after {BIN_MS} ms averaging: {len(df_avg)}")
 
 # Filter data to match the figure's axis ranges
 # x-axis: 0-10 (ne in 10^19 m^-3)

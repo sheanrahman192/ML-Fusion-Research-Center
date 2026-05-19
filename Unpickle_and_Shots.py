@@ -8,14 +8,14 @@ import pandas as pd
 
 # Unpickle the compressed data once
 #Replace plasma_data.pkl.gz with the name of the pickle file you want to unpickle ("LABEL_PROPAGATED_DATABASE.pkl.gz")
-with gzip.open('plasma_data.pkl.gz', 'rb') as f:
+with gzip.open('LABEL_PROPAGATED_DATABASE.pkl.gz', 'rb') as f:
     data = pickle.load(f)
 
 df = pd.DataFrame(data)
 
 # Stream to CSV in chunks with a simple progress indicator
 #Replace plasma_data.csv with the name of the csv file you want to write to ("LABEL_PROPAGATED_DATABASE")
-output_csv = 'plasma_data.csv'
+output_csv = 'LABEL_PROPAGATED_DATABASE.csv'
 chunk_size = 300_000  # rows per chunk (tune as needed)
 
 total_rows = len(df)

@@ -148,7 +148,7 @@ def load_and_prepare_data():
 
     # Select only the specified 7 features
     important_features = ['iln3iamp', 'betan', 'density', 'li',
-                         'tritop', 'fs04_max_smoothed']
+                         'tritop', 'fs_sum_max_smoothed']
     selected_features = [f for f in important_features if f in df.columns]
 
     print(f"Using {len(selected_features)} features: {selected_features}")
@@ -156,8 +156,11 @@ def load_and_prepare_data():
     # Sort by shot and time
     df_sorted = df.sort_values(['shot', 'time']).reset_index(drop=True)
 
-    # Filter out state 0
-    df_filtered = df_sorted[df_sorted['state'] != 0].copy()
+    # Filter: exclude state 0; only {1,2,3,4} are valid class labels (state -1 etc. would remap to invalid indices)
+    valid_states = [1, 2, 3, 4]
+    df_filtered = df_sorted[
+        (df_sorted['state'] != 0) & (df_sorted['state'].isin(valid_states))
+    ].copy()
 
     # Extract features and labels
     X = df_filtered[selected_features].values

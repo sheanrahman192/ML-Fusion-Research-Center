@@ -145,14 +145,14 @@ class PlasmaDataset(Dataset):
 def load_and_prepare_data():
     """Load and preprocess the plasma data - includes time column for future prediction"""
     print("Loading data...")
-    df = pd.read_csv('/mnt/homes/sr4240/my_folder/combined_database.csv')
+    df = pd.read_csv('/mnt/homes/sr4240/my_folder/plasma_data.csv')
 
     # Remove problematic shot
     df = df[df['shot'] != 191675].copy()
 
     # Select only the specified 7 features
     important_features = ['iln3iamp', 'betan', 'density', 'li',
-                         'tritop', 'fs04_past_max_smoothed']
+                         'tritop', 'fs_sum_past_max_smoothed']
     selected_features = [f for f in important_features if f in df.columns]
 
     print(f"Using {len(selected_features)} features: {selected_features}")
@@ -203,7 +203,7 @@ def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, p
     print(f"Total unique shots: {n_shots}")
 
     # Randomly shuffle shots
-    np.random.seed(42)
+    np.random.seed(43)
     shuffled_shots = np.random.permutation(unique_shots)
 
     # Split shots into train/val/test (70/15/15)
@@ -221,8 +221,8 @@ def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, p
     val_windows, val_labels = [], []
     test_windows, test_labels = [], []
 
-    # Label mapping
-    label_mapping = {1: 0, 2: 1, 3: 2, 4: 3}
+    # Label mapping: raw state 0=Suppressed, 1=Dithering, 2=Mitigated, 3=ELMing
+    label_mapping = {0: 0, 1: 1, 2: 2, 3: 3}
     
     # Track statistics
     windows_created = 0
@@ -272,8 +272,8 @@ def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, p
             # Get the label at the future time point
             future_label = shot_labels[future_local_idx]
 
-            # Only create training example if target label is valid (1, 2, 3, 4)
-            # Skip state=0 (unknown) and state=-1 (uncertain from label propagation)
+            # Only create training example if target label is valid (0, 1, 2, 3)
+            # Skip state=-1 (uncertain from label propagation) and other invalid values
             if int(future_label) not in label_mapping:
                 windows_skipped_invalid_label += 1
                 continue
@@ -427,9 +427,9 @@ def evaluate_model(model, test_loader, device, class_names):
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
 
-    # Print classification report
+    # Print classification report (labels= ensures correct report when not all classes appear in data)
     print("\nClassification Report:")
-    print(classification_report(all_labels, all_preds, target_names=class_names, digits=4))
+    print(classification_report(all_labels, all_preds, target_names=class_names, labels=[0, 1, 2, 3], digits=4))
 
     # Calculate and print test accuracy
     test_acc = accuracy_score(all_labels, all_preds)
@@ -471,7 +471,7 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[0, 1].grid(True, alpha=0.3)
 
     # Plot confusion matrix (normalized)
-    cm = confusion_matrix(all_labels, all_preds, normalize='true')
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2, 3], normalize='true')
     sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues',
                 xticklabels=class_names, yticklabels=class_names,
                 ax=axes[1, 0])
@@ -479,8 +479,8 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[1, 0].set_ylabel('True Label')
     axes[1, 0].set_xlabel('Predicted Label')
 
-    # Plot confusion matrix (counts)
-    cm_counts = confusion_matrix(all_labels, all_preds)
+    # Plot confusion matrix (counts) - labels= ensures 4x4 when not all classes appear
+    cm_counts = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2, 3])
     sns.heatmap(cm_counts, annot=True, fmt='d', cmap='Blues',
                 xticklabels=class_names, yticklabels=class_names,
                 ax=axes[1, 1])

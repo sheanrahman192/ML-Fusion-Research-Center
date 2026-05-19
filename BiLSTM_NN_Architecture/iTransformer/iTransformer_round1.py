@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -19,55 +19,53 @@ torch.manual_seed(43)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(43)
 
-class LSTMFirstNN(nn.Module):
+class iTransformer(nn.Module):
     """
-    A hybrid model with LSTM processing FIRST (for temporal patterns)
-    followed by NN layers (for feature transformation).
-    This avoids the slow loop while preserving temporal structure.
-    """
-    def __init__(self, n_features, n_classes=4, lstm_hidden=128, nn_hidden_sizes=[256, 128]):
-        super(LSTMFirstNN, self).__init__()
+    iTransformer (Inverted Transformer) for plasma window classification.
 
-        # LSTM processes the raw temporal data FIRST
-        # This preserves temporal relationships efficiently
-        self.lstm = nn.LSTM(
-            input_size=n_features,  # Direct input of raw features
-            hidden_size=lstm_hidden,
-            num_layers=2,  # Deeper LSTM for better temporal learning
+    Unlike a vanilla Transformer that tokenizes each time step, the
+    iTransformer INVERTS the embedding: each variate's entire time series
+    is embedded into a single token. Self-attention is then applied ACROSS
+    variates (capturing multivariate correlations) while a feed-forward
+    network learns temporal representations within each variate token.
+
+    Reference: Liu et al., "iTransformer: Inverted Transformers Are
+    Effective for Time Series Forecasting", ICLR 2024.
+    """
+    def __init__(self, n_features, seq_len=150, n_classes=4,
+                 d_model=128, n_heads=8, n_layers=3, d_ff=256, dropout=0.2):
+        super(iTransformer, self).__init__()
+
+        self.n_features = n_features
+        self.seq_len = seq_len
+
+        # INVERTED EMBEDDING: map each variate's whole time series -> one token
+        # Input variate series of length seq_len -> token of dim d_model
+        self.variate_embedding = nn.Linear(seq_len, d_model)
+        self.embed_dropout = nn.Dropout(dropout)
+
+        # Transformer encoder: attention is computed OVER variate tokens.
+        # No positional encoding is used because variates have no inherent
+        # ordering (this is a defining choice of the iTransformer).
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation='gelu',
             batch_first=True,
-            bidirectional=True,  # Bidirectional for better temporal understanding
-            dropout=0.2
+            norm_first=True  # pre-norm for training stability
         )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.encoder_norm = nn.LayerNorm(d_model)
 
-        # After LSTM, we have temporal features
-        lstm_output_size = lstm_hidden * 2  # Bidirectional
-
-        # NN layers process the LSTM output
-        # No loops needed - we can process the entire LSTM output at once!
-        nn_layers = []
-        input_dim = lstm_output_size
-
-        for hidden_size in nn_hidden_sizes:
-            nn_layers.extend([
-                nn.Linear(input_dim, hidden_size),
-                nn.ReLU(),
-                nn.BatchNorm1d(hidden_size),
-                nn.Dropout(0.25)
-            ])
-            input_dim = hidden_size
-
-        self.nn_layers = nn.Sequential(*nn_layers)
-
-        # Feature aggregation from sequence
-        self.attention_weights = nn.Sequential(
-            nn.Linear(lstm_output_size, 1),
-            nn.Softmax(dim=1)
-        )
-
-        # Final classifier
+        # Classification head: flatten all variate tokens -> class logits
         self.classifier = nn.Sequential(
-            nn.Linear(input_dim + lstm_output_size, 128),
-            nn.ReLU(),
+            nn.Linear(n_features * d_model, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.GELU(),
             nn.Dropout(0.3),
             nn.Linear(128, n_classes)
         )
@@ -77,51 +75,41 @@ class LSTMFirstNN(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
         # Count parameters by component
-        lstm_params = sum(p.numel() for name, p in self.named_parameters() if 'lstm' in name)
-        nn_params = sum(p.numel() for name, p in self.named_parameters() if 'nn_layers' in name)
-        attention_params = sum(p.numel() for name, p in self.named_parameters() if 'attention' in name)
+        embed_params = sum(p.numel() for name, p in self.named_parameters() if 'variate_embedding' in name)
+        encoder_params = sum(p.numel() for name, p in self.named_parameters() if 'encoder' in name)
         classifier_params = sum(p.numel() for name, p in self.named_parameters() if 'classifier' in name)
 
         print(f"\n{'='*60}")
-        print(f"LSTM-First-NN Model Parameter Count:")
+        print(f"iTransformer Model Parameter Count:")
         print(f"{'='*60}")
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
         print(f"\nParameters by component:")
-        print(f"  - LSTM layers: {lstm_params:,} ({lstm_params/total_params*100:.1f}%)")
-        print(f"  - NN layers: {nn_params:,} ({nn_params/total_params*100:.1f}%)")
-        print(f"  - Attention: {attention_params:,} ({attention_params/total_params*100:.1f}%)")
+        print(f"  - Inverted embedding: {embed_params:,} ({embed_params/total_params*100:.1f}%)")
+        print(f"  - Transformer encoder: {encoder_params:,} ({encoder_params/total_params*100:.1f}%)")
         print(f"  - Classifier: {classifier_params:,} ({classifier_params/total_params*100:.1f}%)")
         print(f"{'='*60}")
-        print(f"Architecture: LSTM → NN (no loops, preserves temporal structure)")
+        print(f"Architecture: Inverted embedding (variate->token) -> "
+              f"attention across {n_features} variates -> classifier")
 
     def forward(self, x):
         # x shape: (batch_size, n_features, sequence_length)
+        # This is ALREADY in the inverted layout: each variate is a row,
+        # so we embed along the time dimension directly.
         batch_size, n_features, seq_len = x.shape
 
-        # Transpose for LSTM: (batch_size, sequence_length, n_features)
-        x = x.transpose(1, 2)
+        # INVERTED EMBEDDING: each variate's series -> a token of dim d_model
+        # (batch_size, n_features, seq_len) -> (batch_size, n_features, d_model)
+        tokens = self.variate_embedding(x)
+        tokens = self.embed_dropout(tokens)
 
-        # STEP 1: LSTM processes the temporal sequence
-        lstm_output, (hidden, cell) = self.lstm(x)
-        # lstm_output shape: (batch_size, seq_len, lstm_hidden*2)
+        # Self-attention ACROSS the n_features variate tokens
+        encoded = self.encoder(tokens)            # (batch, n_features, d_model)
+        encoded = self.encoder_norm(encoded)
 
-        # STEP 2: Apply attention to aggregate temporal information
-        attention = self.attention_weights(lstm_output)  # (batch_size, seq_len, 1)
-        attended_features = torch.sum(lstm_output * attention, dim=1)  # (batch_size, lstm_hidden*2)
-
-        # STEP 3: Process the final LSTM hidden state through NN
-        # Take the last hidden state from both directions
-        final_hidden = lstm_output[:, -1, :]  # (batch_size, lstm_hidden*2)
-
-        # Process through NN layers (no loop needed!)
-        nn_features = self.nn_layers(final_hidden)  # (batch_size, nn_hidden[-1])
-
-        # STEP 4: Combine attended features with NN features
-        combined = torch.cat([nn_features, attended_features], dim=1)
-
-        # STEP 5: Final classification
-        output = self.classifier(combined)
+        # Flatten all variate tokens and classify
+        flat = encoded.reshape(batch_size, -1)    # (batch, n_features * d_model)
+        output = self.classifier(flat)
 
         return output
 
@@ -147,7 +135,7 @@ def load_and_prepare_data():
     df = df[df['shot'] != 191675].copy()
 
     # Select only the specified 7 features
-    important_features = ['iln3iamp', 'betan', 'density', 'li', 'tritop', 'fs04_max_smoothed']
+    important_features = ['iln3iamp', 'betan', 'density', 'li', 'tritop', 'fs_sum_max_smoothed']
     selected_features = [f for f in important_features if f in df.columns]
 
     print(f"Using {len(selected_features)} features: {selected_features}")
@@ -155,8 +143,10 @@ def load_and_prepare_data():
     # Sort by shot and time
     df_sorted = df.sort_values(['shot', 'time']).reset_index(drop=True)
 
-    # Filter out state 0
-    df_filtered = df_sorted[df_sorted['state'] != 0].copy()
+    # Valid labels are already 0-indexed:
+    # 0=Suppressed, 1=Dithering, 2=Mitigated, 3=ELMing. Exclude unknown values like -1.
+    valid_states = [0, 1, 2, 3]
+    df_filtered = df_sorted[df_sorted['state'].isin(valid_states)].copy()
 
     # Extract features and labels
     X = df_filtered[selected_features].values
@@ -169,8 +159,7 @@ def load_and_prepare_data():
     y = y[valid_mask]
     shots = shots[valid_mask]
 
-    # Convert labels from 1-indexed (1,2,3,4) to 0-indexed (0,1,2,3) for PyTorch
-    y = y.astype(int) - 1
+    y = y.astype(int)
 
     print(f"Data shape after cleaning: {X.shape}")
     print(f"Label distribution: {Counter(y)}")
@@ -182,13 +171,7 @@ def load_and_prepare_data():
     return X_scaled, y, shots, selected_features, scaler
 
 def create_windows_for_shots(X, y, shots, shot_list, window_size=150):
-    """
-    Create windows for a specific list of shots.
-    
-    IMPORTANT: This function ensures that ALL datapoints from shots in shot_list
-    are used ONLY for the specified split (train/val/test). No datapoint from
-    a shot will appear in multiple splits.
-    """
+    """Create windows for a specific list of shots"""
     windows, labels = [], []
     center_idx = window_size // 2
 
@@ -223,18 +206,8 @@ def create_windows_for_shots(X, y, shots, shot_list, window_size=150):
     return windows, labels
 
 def create_windows_with_shot_split(X, y, shots, window_size=150, train_ratio=0.7, val_ratio=0.15):
-    """
-    Create windows and perform shot-based split.
-    
-    CRITICAL: This function ensures NO DATA LEAKAGE by assigning each shot
-    entirely to ONE of train/val/test. All datapoints from a shot go to the
-    same split. This prevents information leakage between splits.
-    """
-    print(f"Creating windows of size {window_size} with SHOT-BASED split (NO LEAKAGE)...")
-    print("=" * 60)
-    print("IMPORTANT: Each shot is assigned to ONLY ONE split (train/val/test)")
-    print("All datapoints from a shot belong to the same split")
-    print("=" * 60)
+    """Create windows and perform shot-based split"""
+    print(f"Creating windows of size {window_size} with SHOT-BASED split...")
 
     # Get unique shots
     unique_shots = np.unique(shots)
@@ -250,30 +223,16 @@ def create_windows_with_shot_split(X, y, shots, window_size=150, train_ratio=0.7
     val_end = int((train_ratio + val_ratio) * n_shots)
 
     # Split shots into train/val/test
-    # Each shot is assigned to EXACTLY ONE split
     train_shots = shuffled_shots[:train_end]
     val_shots = shuffled_shots[train_end:val_end]
     test_shots = shuffled_shots[val_end:]
 
     print(f"\nShot split:")
-    print(f"  Train shots: {len(train_shots)} shots")
-    print(f"  Val shots: {len(val_shots)} shots")
-    print(f"  Test shots: {len(test_shots)} shots")
-
-    # Verify no overlap between shot sets
-    train_set = set(train_shots)
-    val_set = set(val_shots)
-    test_set = set(test_shots)
-    
-    assert len(train_set & val_set) == 0, "ERROR: Overlap between train and val shots!"
-    assert len(train_set & test_set) == 0, "ERROR: Overlap between train and test shots!"
-    assert len(val_set & test_set) == 0, "ERROR: Overlap between val and test shots!"
-    assert len(train_set) + len(val_set) + len(test_set) == n_shots, "ERROR: Not all shots assigned!"
-    
-    print("✓ Verification passed: No shot overlap between splits")
+    print(f"  Train shots: {len(train_shots)}")
+    print(f"  Val shots: {len(val_shots)}")
+    print(f"  Test shots: {len(test_shots)}")
 
     # Create windows for each split
-    # Each shot's datapoints are dedicated to ONE split only
     print("\nCreating windows for each split...")
     train_windows, train_labels = create_windows_for_shots(X, y, shots, train_shots, window_size)
     val_windows, val_labels = create_windows_for_shots(X, y, shots, val_shots, window_size)
@@ -289,50 +248,22 @@ def create_windows_with_shot_split(X, y, shots, window_size=150, train_ratio=0.7
     print(f"  Val: {Counter(val_labels)}")
     print(f"  Test: {Counter(test_labels)}")
 
-    # Additional verification: Check that no datapoint appears in multiple splits
-    # by verifying shot IDs in the original data
-    print("\n" + "=" * 60)
-    print("Verifying no data leakage...")
-    
-    # Get shot IDs for each window (by checking which shots contributed)
-    train_shot_ids = set()
-    val_shot_ids = set()
-    test_shot_ids = set()
-    
-    # For each split, identify which shots contributed windows
-    for shot_id in train_shots:
-        train_shot_ids.add(shot_id)
-    for shot_id in val_shots:
-        val_shot_ids.add(shot_id)
-    for shot_id in test_shots:
-        test_shot_ids.add(shot_id)
-    
-    # Verify no overlap
-    overlap_train_val = train_shot_ids & val_shot_ids
-    overlap_train_test = train_shot_ids & test_shot_ids
-    overlap_val_test = val_shot_ids & test_shot_ids
-    
-    if len(overlap_train_val) > 0:
-        raise ValueError(f"DATA LEAKAGE DETECTED: Shots {overlap_train_val} appear in both train and val!")
-    if len(overlap_train_test) > 0:
-        raise ValueError(f"DATA LEAKAGE DETECTED: Shots {overlap_train_test} appear in both train and test!")
-    if len(overlap_val_test) > 0:
-        raise ValueError(f"DATA LEAKAGE DETECTED: Shots {overlap_val_test} appear in both val and test!")
-    
-    print("✓ Verification passed: No data leakage detected")
-    print("✓ Each shot's datapoints are dedicated to exactly one split")
-    print("=" * 60)
-
     return (train_windows, train_labels,
             val_windows, val_labels,
             test_windows, test_labels)
 
-def train_model(model, train_loader, val_loader, device, n_epochs=50):
+def train_model(model, train_loader, val_loader, device, n_epochs=50, class_weights=None):
     """Train the model"""
     # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5, verbose=True)
+    # ROUND 1: weighted loss (fights class imbalance) + label smoothing
+    # (fights overconfident wrong predictions / exploding val loss)
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    # ROUND 1: AdamW with weight decay for regularization
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-2)
+    # ROUND 1: schedule / select on macro-F1 (correct objective under imbalance)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5, verbose=True)
 
     # Training history
     train_losses, val_losses = [], []
@@ -359,6 +290,8 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            # ROUND 1: gradient clipping for transformer training stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_loss += loss.item()
@@ -389,6 +322,8 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
         # Calculate metrics
         train_acc = accuracy_score(train_labels, train_preds)
         val_acc = accuracy_score(val_labels_list, val_preds)
+        # ROUND 1: macro-F1 is the true objective under heavy class imbalance
+        val_macro_f1 = f1_score(val_labels_list, val_preds, average='macro')
 
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
@@ -400,17 +335,17 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
 
         print(f"Epoch {epoch+1}/{n_epochs}")
         print(f"  Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        print(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}, Val Macro-F1: {val_macro_f1:.4f}")
 
-        # Learning rate scheduling
-        scheduler.step(val_acc)
+        # Learning rate scheduling on macro-F1
+        scheduler.step(val_macro_f1)
 
-        # Early stopping
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_lstm_first_nn_shot_split_noleakage.pth')
+        # Early stopping on macro-F1 (best_val_acc now tracks best macro-F1)
+        if val_macro_f1 > best_val_acc:
+            best_val_acc = val_macro_f1
+            torch.save(model.state_dict(), 'best_itransformer_shot_split.pth')
             patience_counter = 0
-            print(f"  ✓ New best model saved!")
+            print(f"  ✓ New best model saved! (macro-F1={val_macro_f1:.4f})")
         else:
             patience_counter += 1
 
@@ -502,24 +437,21 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[1, 1].set_xlabel('Predicted Label')
 
     plt.tight_layout()
-    plt.savefig('lstm_first_nn_shot_split_noleakage_results.png', dpi=300, bbox_inches='tight')
+    plt.savefig('itransformer_shot_split_results.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    print("Results saved to 'lstm_first_nn_shot_split_noleakage_results.png'")
+    print("Results saved to 'itransformer_shot_split_results.png'")
 
 import time
 
 def main():
     """Main training pipeline"""
     print("=" * 60)
-    print("LSTM-First NN Model for Plasma Classification")
+    print("iTransformer Model for Plasma Classification")
     print("=" * 60)
-    print("Architecture: LSTM processes temporal data → NN transforms features")
-    print("Split Method: SHOT-BASED (NO DATA LEAKAGE)")
-    print("=" * 60)
-    print("CRITICAL: Each shot is assigned to EXACTLY ONE split")
-    print("All datapoints from a shot belong to the same split")
-    print("This ensures no information leakage between train/val/test")
+    print("Architecture: Inverted embedding (each variate -> token) →")
+    print("              self-attention across variates → classifier")
+    print("Split Method: SHOT-BASED (no data leakage between train/val/test)")
     print("=" * 60)
 
     # Set device
@@ -529,7 +461,7 @@ def main():
     # Load data
     X, y, shots, features, scaler = load_and_prepare_data()
 
-    # Create windows and split BY SHOT (ensuring no leakage)
+    # Create windows and split BY SHOT
     train_X, train_y, val_X, val_y, test_X, test_y = create_windows_with_shot_split(X, y, shots)
 
     print(f"\nDataset sizes:")
@@ -546,8 +478,30 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
+    # ROUND 1: balanced class weights to counter heavy class imbalance
+    cw = compute_class_weight('balanced', classes=np.array([0, 1, 2, 3]), y=train_y)
+    class_weights = torch.FloatTensor(cw)
+    print(f"\nClass weights (balanced): {dict(enumerate(np.round(cw, 4)))}")
+
+    # iTransformer hyperparameters
+    window_size = 150
+    d_model = 128
+    n_heads = 8
+    n_layers = 3
+    d_ff = 256
+    dropout = 0.2
+
     # Create model
-    model = LSTMFirstNN(n_features=len(features), n_classes=4).to(device)
+    model = iTransformer(
+        n_features=len(features),
+        seq_len=window_size,
+        n_classes=4,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        d_ff=d_ff,
+        dropout=dropout
+    ).to(device)
 
     # Test forward pass speed
     print("\nTesting forward pass speed...")
@@ -560,18 +514,15 @@ def main():
     forward_time = time.time() - start_time
     print(f"Forward pass time for batch of {test_batch.shape[0]}: {forward_time:.3f} seconds")
 
-    if forward_time > 0.1:
-        print("  Note: Still fast! Much better than the loop-based approach (~0.9s)")
-
     # Train model
     print("\nStarting training...")
     train_losses, val_losses, train_accs, val_accs = train_model(
-        model, train_loader, val_loader, device, n_epochs=50
+        model, train_loader, val_loader, device, n_epochs=50, class_weights=class_weights
     )
 
     # Load best model
     print("\nLoading best model...")
-    model.load_state_dict(torch.load('best_lstm_first_nn_shot_split_noleakage.pth'))
+    model.load_state_dict(torch.load('best_itransformer_shot_split.pth'))
 
     # Evaluate on test set
     class_names = ['Suppressed', 'Dithering', 'Mitigated', 'ELMing']
@@ -585,7 +536,7 @@ def main():
     print(f"\nFinal Test Accuracy: {test_acc:.4f}")
 
     # Save complete model checkpoint for later use
-    save_path = '/mnt/homes/sr4240/my_folder/BiLSTM_NN_Architecture/bilstm_nn_complete_model_noleakage.pth'
+    save_path = '/mnt/homes/sr4240/my_folder/BiLSTM_NN_Architecture/iTransformer/itransformer_complete_model.pth'
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'scaler_mean': scaler.mean_,
@@ -593,9 +544,12 @@ def main():
         'features': features,
         'n_features': len(features),
         'n_classes': 4,
-        'lstm_hidden': 128,
-        'nn_hidden_sizes': [256, 128],
-        'window_size': 150,
+        'd_model': d_model,
+        'n_heads': n_heads,
+        'n_layers': n_layers,
+        'd_ff': d_ff,
+        'dropout': dropout,
+        'window_size': window_size,
         'class_names': class_names,
         'test_accuracy': test_acc
     }
@@ -603,15 +557,13 @@ def main():
     print(f"\n✓ Complete model checkpoint saved to: {save_path}")
     print("  Includes: model weights, scaler, features, label mappings")
 
-    # Also save as best_lstm_first_nn_noleakage.pth
-    torch.save(checkpoint, 'best_lstm_first_nn_noleakage.pth')
-    print(f"✓ Also saved to: best_lstm_first_nn_noleakage.pth")
+    # Also save as best_itransformer.pth
+    torch.save(checkpoint, 'best_itransformer.pth')
+    print(f"✓ Also saved to: best_itransformer.pth")
 
     print("\n" + "=" * 60)
     print("Training Complete!")
-    print("=" * 60)
-    print("VERIFIED: Shot-based split ensures NO data leakage between splits")
-    print("Each shot's datapoints are dedicated to exactly one split")
+    print("Note: Shot-based split ensures no data leakage between splits")
     print("=" * 60)
 
 if __name__ == "__main__":

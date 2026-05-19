@@ -1,4 +1,4 @@
-#the script used for fall 2025 work
+#PatchTST script for fall 2025 work - same I/O as LSTM_50_Binary_Transitions.py with transformer architecture
 
 import pandas as pd
 import numpy as np
@@ -26,58 +26,74 @@ PREDICTION_HORIZON_MS = 50
 # Variant suffix for saves (Suppressed vs Dithering/ELMing/Mitigated)
 VARIANT_SUFFIX = '_supp_vs_dem'
 
-class LSTMFirstNN(nn.Module):
+
+class PatchTST(nn.Module):
     """
-    A hybrid model with LSTM processing FIRST (for temporal patterns)
-    followed by NN layers (for feature transformation).
+    PatchTST: Patch Time Series Transformer for binary classification.
+
+    Architecture (Nie et al., 2023, "A Time Series is Worth 64 Words"):
+      1. Split each channel of the input sequence into overlapping patches.
+      2. Project patches into d_model via a shared linear embedding.
+      3. Add learnable positional encoding.
+      4. Process patches with a Transformer encoder applied independently per
+         channel (channel-independence with shared weights).
+      5. Attention-pool across patches per channel to a single vector.
+      6. Concatenate channel embeddings and classify.
+
+    Channel-independence (each variable processed separately by shared
+    transformer weights) is the core trick that makes PatchTST generalize
+    well on multivariate time series compared to channel-mixing models.
+
     Uses 150 datapoints BEFORE the classification point.
     Predicts state 50ms into the future.
-    Unidirectional LSTM only (not bidirectional).
     Binary classification: Suppressed (0) vs Dithering/ELMing/Mitigated (1).
     """
-    def __init__(self, n_features, n_classes=2, lstm_hidden=64, nn_hidden_sizes=[128, 64]):
-        super(LSTMFirstNN, self).__init__()
+    def __init__(self, n_features, n_classes=2, seq_len=150,
+                 patch_len=15, stride=8,
+                 d_model=128, n_heads=8, n_layers=3, d_ff=256,
+                 dropout=0.2, head_dropout=0.3):
+        super(PatchTST, self).__init__()
+        self.n_features = n_features
+        self.seq_len = seq_len
+        self.patch_len = patch_len
+        self.stride = stride
+        self.n_patches = (seq_len - patch_len) // stride + 1
+        self.d_model = d_model
 
-        # LSTM processes the raw temporal data FIRST
-        # Unidirectional for future prediction
-        self.lstm = nn.LSTM(
-            input_size=n_features,  # Direct input of raw features
-            hidden_size=lstm_hidden,
-            num_layers=2,  # Deeper LSTM for better temporal learning
+        # Patch embedding: project each patch (patch_len-dim vector) to d_model
+        self.patch_embedding = nn.Linear(patch_len, d_model)
+
+        # Learnable positional encoding (one vector per patch position)
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.n_patches, d_model) * 0.02)
+
+        self.embed_dropout = nn.Dropout(dropout)
+
+        # Transformer encoder (shared across channels - channel independence)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation='gelu',
             batch_first=True,
-            bidirectional=False,  # Unidirectional for forward-in-time prediction
-            dropout=0.4
+            norm_first=True  # Pre-LN for training stability
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.encoder_norm = nn.LayerNorm(d_model)
 
-        # After LSTM, we have temporal features
-        lstm_output_size = lstm_hidden  # Unidirectional
+        # Attention pooling across patches (aggregates the patch sequence per channel)
+        self.patch_attention = nn.Linear(d_model, 1)
 
-        # NN layers process the LSTM output
-        nn_layers = []
-        input_dim = lstm_output_size
-
-        for hidden_size in nn_hidden_sizes:
-            nn_layers.extend([
-                nn.Linear(input_dim, hidden_size),
-                nn.ReLU(),
-                nn.BatchNorm1d(hidden_size),
-                nn.Dropout(0.45)
-            ])
-            input_dim = hidden_size
-
-        self.nn_layers = nn.Sequential(*nn_layers)
-
-        # Feature aggregation from sequence
-        self.attention_weights = nn.Sequential(
-            nn.Linear(lstm_output_size, 1),
-            nn.Softmax(dim=1)
-        )
-
-        # Final classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim + lstm_output_size, 64),
-            nn.ReLU(),
-            nn.Dropout(0.5),
+        # Classification head: aggregates pooled features across all channels
+        head_input_dim = n_features * d_model
+        self.head = nn.Sequential(
+            nn.LayerNorm(head_input_dim),
+            nn.Linear(head_input_dim, 256),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(256, 64),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
             nn.Linear(64, n_classes)
         )
 
@@ -85,63 +101,71 @@ class LSTMFirstNN(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-        # Count parameters by component
-        lstm_params = sum(p.numel() for name, p in self.named_parameters() if 'lstm' in name)
-        nn_params = sum(p.numel() for name, p in self.named_parameters() if 'nn_layers' in name)
-        attention_params = sum(p.numel() for name, p in self.named_parameters() if 'attention' in name)
-        classifier_params = sum(p.numel() for name, p in self.named_parameters() if 'classifier' in name)
+        embed_params = sum(p.numel() for n, p in self.named_parameters()
+                           if 'patch_embedding' in n or 'pos_embedding' in n)
+        transformer_params = sum(p.numel() for n, p in self.named_parameters()
+                                 if 'transformer' in n or 'encoder_norm' in n)
+        attention_params = sum(p.numel() for n, p in self.named_parameters() if 'patch_attention' in n)
+        head_params = sum(p.numel() for n, p in self.named_parameters() if 'head' in n)
 
         print(f"\n{'='*60}")
-        print(f"LSTM-First-NN Model Parameter Count (Binary Classification):")
+        print(f"PatchTST Model Parameter Count (Binary Classification):")
         print(f"{'='*60}")
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
         print(f"\nParameters by component:")
-        print(f"  - LSTM layers: {lstm_params:,} ({lstm_params/total_params*100:.1f}%)")
-        print(f"  - NN layers: {nn_params:,} ({nn_params/total_params*100:.1f}%)")
-        print(f"  - Attention: {attention_params:,} ({attention_params/total_params*100:.1f}%)")
-        print(f"  - Classifier: {classifier_params:,} ({classifier_params/total_params*100:.1f}%)")
+        print(f"  - Patch + positional embedding: {embed_params:,} ({embed_params/total_params*100:.1f}%)")
+        print(f"  - Transformer encoder ({n_layers} layers): {transformer_params:,} ({transformer_params/total_params*100:.1f}%)")
+        print(f"  - Attention pooling: {attention_params:,} ({attention_params/total_params*100:.1f}%)")
+        print(f"  - Classification head: {head_params:,} ({head_params/total_params*100:.1f}%)")
         print(f"{'='*60}")
-        print(f"Architecture: LSTM (unidirectional) → NN → Classifier")
+        print(f"Architecture: Patching -> Channel-Independent Transformer -> Attn Pool -> Classifier")
+        print(f"Patches: {self.n_patches} (patch_len={patch_len}, stride={stride})")
+        print(f"d_model={d_model}, n_heads={n_heads}, d_ff={d_ff}, dropout={dropout}")
         print(f"Classification: Binary (Suppressed=0, Dithering/ELMing/Mitigated=1)")
 
     def forward(self, x):
         # x shape: (batch_size, n_features, sequence_length)
         batch_size, n_features, seq_len = x.shape
 
-        # Transpose for LSTM: (batch_size, sequence_length, n_features)
-        x = x.transpose(1, 2)
+        # STEP 1: Patch the sequence with a sliding window
+        # (B, F, L) -> (B, F, n_patches, patch_len)
+        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
 
-        # STEP 1: LSTM processes the temporal sequence
-        lstm_output, (hidden, cell) = self.lstm(x)
-        # lstm_output shape: (batch_size, seq_len, lstm_hidden)
+        # STEP 2: Merge batch and feature dims for channel-independent processing
+        # (B, F, n_patches, patch_len) -> (B*F, n_patches, patch_len)
+        x = x.reshape(batch_size * n_features, self.n_patches, self.patch_len)
 
-        # STEP 2: Apply attention to aggregate temporal information
-        attention = self.attention_weights(lstm_output)  # (batch_size, seq_len, 1)
-        attended_features = torch.sum(lstm_output * attention, dim=1)  # (batch_size, lstm_hidden)
+        # STEP 3: Project each patch into the model dimension
+        x = self.patch_embedding(x)  # (B*F, n_patches, d_model)
 
-        # STEP 3: Process the final LSTM hidden state through NN
-        # Take the last hidden state (for future prediction)
-        final_hidden = lstm_output[:, -1, :]  # (batch_size, lstm_hidden)
+        # STEP 4: Add learnable positional encoding (broadcast over B*F)
+        x = x + self.pos_embedding
+        x = self.embed_dropout(x)
 
-        # Process through NN layers
-        nn_features = self.nn_layers(final_hidden)  # (batch_size, nn_hidden[-1])
+        # STEP 5: Transformer encoder
+        x = self.transformer(x)        # (B*F, n_patches, d_model)
+        x = self.encoder_norm(x)
 
-        # STEP 4: Combine attended features with NN features
-        combined = torch.cat([nn_features, attended_features], dim=1)
+        # STEP 6: Attention-pool across patches (per channel)
+        attn_logits = self.patch_attention(x)               # (B*F, n_patches, 1)
+        attn_weights = torch.softmax(attn_logits, dim=1)
+        x = torch.sum(x * attn_weights, dim=1)              # (B*F, d_model)
 
-        # STEP 5: Final classification
-        output = self.classifier(combined)
+        # STEP 7: Reshape so each sample's channels are concatenated, then classify
+        x = x.reshape(batch_size, n_features * self.d_model)
+        output = self.head(x)
 
         return output
+
 
 class FocalLoss(nn.Module):
     """
     Focal Loss for addressing class imbalance.
     Focal loss focuses learning on hard examples.
-    
+
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    
+
     Args:
         alpha: Weighting factor for rare class (tensor, list, or float)
         gamma: Focusing parameter (gamma > 0 reduces the loss for well-classified examples)
@@ -159,11 +183,11 @@ class FocalLoss(nn.Module):
             self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
-        
+
     def forward(self, inputs, targets):
         ce_loss = nn.CrossEntropyLoss(reduction='none')(inputs, targets)
         pt = torch.exp(-ce_loss)  # pt is the probability of the true class
-        
+
         # Apply class weights if provided
         if self.alpha is not None:
             if isinstance(self.alpha, (float, int)):
@@ -174,12 +198,13 @@ class FocalLoss(nn.Module):
             focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
         else:
             focal_loss = (1 - pt) ** self.gamma * ce_loss
-        
+
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
             return focal_loss.sum()
         return focal_loss
+
 
 class PlasmaDataset(Dataset):
     """Dataset class for plasma data windows"""
@@ -193,6 +218,7 @@ class PlasmaDataset(Dataset):
     def __getitem__(self, idx):
         # Transpose to get (n_features, sequence_length) format
         return self.windows[idx].T, self.labels[idx]
+
 
 def load_and_prepare_data():
     """Load and preprocess the plasma data - includes time column for future prediction"""
@@ -216,37 +242,37 @@ def load_and_prepare_data():
         fs04_values = df_sorted['fs04'].values
         times_temp = df_sorted['time'].values
         shots_temp = df_sorted['shot'].values
-        
+
         # Initialize rate of change array
         fs04_rate_of_change = np.zeros(len(df_sorted))
-        
+
         # Calculate rate of change per shot (reset at shot boundaries)
         for shot_id in df_sorted['shot'].unique():
             shot_mask = shots_temp == shot_id
             shot_indices = np.where(shot_mask)[0]
-            
+
             if len(shot_indices) > 1:
                 # Calculate differences
                 fs04_diff = np.diff(fs04_values[shot_indices])
                 time_diff = np.diff(times_temp[shot_indices])
-                
+
                 # Avoid division by zero (set to 0 if time_diff is 0)
                 time_diff_safe = np.where(time_diff == 0, 1, time_diff)
                 rate = fs04_diff / time_diff_safe
-                
+
                 # Set first point in shot to 0 (no previous point), rest to calculated rate
                 fs04_rate_of_change[shot_indices[0]] = 0.0
                 fs04_rate_of_change[shot_indices[1:]] = rate
-        
+
         # Add rate of change as a new column
         df_sorted['fs04_rate_of_change'] = fs04_rate_of_change
-        # selected_features.append('fs04_rate_of_change')  # Removed from LSTM input features
-    
+        # selected_features.append('fs04_rate_of_change')  # Removed from input features
+
     print(f"Using {len(selected_features)} features: {selected_features}")
 
     # Keep ALL data (including state=0 and state=-1) for temporal context
     # We'll filter invalid labels only when creating prediction targets
-    
+
     # Extract features, labels, times, and shots
     X = df_sorted[selected_features].values
     y = df_sorted['state'].values
@@ -269,17 +295,18 @@ def load_and_prepare_data():
 
     return X_scaled, y, times, shots, selected_features, scaler
 
+
 def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, prediction_horizon_ms=50):
     """Create windows and perform random split BY SHOT - predicting state at future time
-    
+
     This function splits data by shot number, ensuring all windows from the same
     shot end up in the same split (train, val, or test).
-    
+
     The label is taken from the point that is prediction_horizon_ms in the future
     from the end of the window.
-    
+
     Returns current states for transition analysis:
-    - Binary mapping: Suppressed (1) → 0, Dithering/ELMing/Mitigated (2,3,4) → 1
+    - Binary mapping: Suppressed (1) -> 0, Dithering/ELMing/Mitigated (2,3,4) -> 1
     - Also returns current states (at end of window) for transition analysis
     """
     print(f"Creating windows of size {window_size} (predicting {prediction_horizon_ms}ms in the future)...")
@@ -309,16 +336,16 @@ def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, p
     train_windows, train_labels = [], []
     val_windows, val_labels = [], []
     test_windows, test_labels = [], []
-    
+
     # Also track current states for transition analysis
     train_current_states = []
     val_current_states = []
     test_current_states = []
 
-    # Binary label mapping: Suppressed (1) → 0, Dithering/ELMing/Mitigated (2,3,4) → 1
+    # Binary label mapping: Suppressed (1) -> 0, Dithering/ELMing/Mitigated (2,3,4) -> 1
     # Also map current states for transition analysis
     binary_label_mapping = {1: 0, 2: 1, 3: 1, 4: 1}
-    
+
     # Track statistics
     windows_created = 0
     windows_skipped_no_future = 0
@@ -354,22 +381,22 @@ def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, p
         # Create windows for this shot
         for i in range(len(shot_indices) - window_size + 1):
             window = shot_X[i:i + window_size]
-            
+
             # Get the time at the end of the window
             window_end_time = shot_times[i + window_size - 1]
             target_time = window_end_time + prediction_horizon_ms
-            
+
             # Get the current state (at the end of the window)
             current_label = shot_labels[i + window_size - 1]
-            
+
             # OPTIMIZATION: Use binary search O(log n) instead of full array scan O(n)
             future_local_idx = np.searchsorted(shot_times, target_time)
-            
+
             if future_local_idx >= len(shot_times):
                 # No future data available for this window
                 windows_skipped_no_future += 1
                 continue
-            
+
             # Get the label at the future time point
             future_label = shot_labels[future_local_idx]
 
@@ -401,7 +428,7 @@ def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, p
     print(f"  Windows created: {windows_created:,}")
     print(f"  Skipped (no future data): {windows_skipped_no_future:,}")
     print(f"  Skipped (invalid label): {windows_skipped_invalid_label:,}")
-    
+
     print(f"\nCreated windows:")
     print(f"  Train: {len(train_windows)} windows from {len(train_shots)} shots")
     print(f"  Val: {len(val_windows)} windows from {len(val_shots)} shots")
@@ -425,7 +452,7 @@ def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, p
     train_windows, train_labels, train_current_states = oversample_transitions(
         train_windows, train_labels, train_current_states
     )
-    
+
     print(f"After oversampling:")
     print(f"  Train: {len(train_windows)} windows")
     print(f"  Label distribution: {Counter(train_labels)}")
@@ -436,41 +463,42 @@ def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, p
             val_windows, val_labels, val_current_states,
             test_windows, test_labels, test_current_states)
 
+
 def oversample_transitions(windows, labels, current_states, transition_multiplier=3, problematic_multiplier=5):
-    """Oversample transition cases, especially problematic 'Suppressed → Dithering/ELMing/Mitigated' transitions
-    
+    """Oversample transition cases, especially problematic 'Suppressed -> Dithering/ELMing/Mitigated' transitions
+
     Args:
         windows: Array of windows
         labels: Array of labels (future states)
         current_states: Array of current states
         transition_multiplier: How many times to duplicate general transition cases
         problematic_multiplier: How many times to duplicate problematic transition cases
-    
+
     Returns:
         Oversampled windows, labels, and current_states
     """
     # Identify transition cases
     transition_mask = current_states != labels
-    
-    # Identify problematic transition: Suppressed (0) → Dithering/ELMing/Mitigated (1)
+
+    # Identify problematic transition: Suppressed (0) -> Dithering/ELMing/Mitigated (1)
     problematic_mask = (current_states == 0) & (labels == 1)
-    
+
     # Get indices
     transition_indices = np.where(transition_mask)[0]
     problematic_indices = np.where(problematic_mask)[0]
     non_transition_indices = np.where(~transition_mask)[0]
-    
+
     print(f"  Before oversampling:")
     print(f"    Total samples: {len(windows)}")
     print(f"    Transition cases: {len(transition_indices)}")
-    print(f"    Problematic transitions (0→1): {len(problematic_indices)}")
+    print(f"    Problematic transitions (0->1): {len(problematic_indices)}")
     print(f"    Non-transition cases: {len(non_transition_indices)}")
-    
+
     # Create oversampled arrays
     oversampled_windows = [windows[i] for i in non_transition_indices]
     oversampled_labels = [labels[i] for i in non_transition_indices]
     oversampled_current_states = [current_states[i] for i in non_transition_indices]
-    
+
     # Add transition cases (excluding problematic ones, they'll be added separately)
     regular_transition_indices = transition_indices[~np.isin(transition_indices, problematic_indices)]
     for idx in regular_transition_indices:
@@ -482,7 +510,7 @@ def oversample_transitions(windows, labels, current_states, transition_multiplie
             oversampled_windows.append(windows[idx])
             oversampled_labels.append(labels[idx])
             oversampled_current_states.append(current_states[idx])
-    
+
     # Add problematic transition cases with higher multiplier
     for idx in problematic_indices:
         oversampled_windows.append(windows[idx])
@@ -493,26 +521,28 @@ def oversample_transitions(windows, labels, current_states, transition_multiplie
             oversampled_windows.append(windows[idx])
             oversampled_labels.append(labels[idx])
             oversampled_current_states.append(current_states[idx])
-    
+
     # Convert back to numpy arrays
     oversampled_windows = np.array(oversampled_windows, dtype=np.float32)
     oversampled_labels = np.array(oversampled_labels)
     oversampled_current_states = np.array(oversampled_current_states)
-    
+
     print(f"  After oversampling:")
     print(f"    Total samples: {len(oversampled_windows)}")
-    print(f"    Problematic transitions (0→1): {np.sum((oversampled_current_states == 0) & (oversampled_labels == 1))}")
-    
+    print(f"    Problematic transitions (0->1): {np.sum((oversampled_current_states == 0) & (oversampled_labels == 1))}")
+
     return oversampled_windows, oversampled_labels, oversampled_current_states
+
 
 def train_model(model, train_loader, val_loader, device, class_weights_tensor, n_epochs=50):
     """Train the model with Focal Loss and class weights for imbalanced data"""
     # Use Focal Loss with class weights (alpha parameter)
     # Focal loss focuses on hard examples, class weights penalize minority class
     criterion = FocalLoss(alpha=class_weights_tensor, gamma=2.0, reduction='mean')
-    
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=8, factor=0.5, min_lr=1e-6)
+
+    # AdamW with weight decay - standard pairing for transformer models
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=8, factor=0.5, verbose=True, min_lr=1e-6)
 
     # Training history
     train_losses, val_losses = [], []
@@ -538,6 +568,8 @@ def train_model(model, train_loader, val_loader, device, class_weights_tensor, n
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            # Gradient clipping for transformer training stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_loss += loss.item()
@@ -587,9 +619,9 @@ def train_model(model, train_loader, val_loader, device, class_weights_tensor, n
         # Early stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), f'best_lstm_50ms_binary_transitions{VARIANT_SUFFIX}.pth')
+            torch.save(model.state_dict(), f'best_patchtst_50ms_binary_transitions{VARIANT_SUFFIX}.pth')
             patience_counter = 0
-            print(f"  ✓ New best model saved!")
+            print(f"  New best model saved!")
         else:
             patience_counter += 1
 
@@ -599,12 +631,13 @@ def train_model(model, train_loader, val_loader, device, class_weights_tensor, n
 
     return train_losses, val_losses, train_accs, val_accs
 
+
 def find_optimal_threshold(model, val_loader, device):
     """Find optimal decision threshold on validation set for better minority class prediction"""
     model.eval()
     val_probs = []
     val_labels = []
-    
+
     with torch.no_grad():
         for batch_X, batch_y in val_loader:
             batch_X = batch_X.to(device)
@@ -612,14 +645,14 @@ def find_optimal_threshold(model, val_loader, device):
             probs = torch.softmax(outputs, dim=1)
             val_probs.extend(probs[:, 1].cpu().numpy())  # Probability of positive class
             val_labels.extend(batch_y.numpy())
-    
+
     val_probs = np.array(val_probs)
     val_labels = np.array(val_labels)
-    
+
     # Try different thresholds and find the one with best F1 score
     best_threshold = 0.5
     best_f1 = 0.0
-    
+
     for threshold in np.linspace(0.1, 0.9, 81):  # Try thresholds from 0.1 to 0.9
         preds = (val_probs >= threshold).astype(int)
         if len(np.unique(preds)) > 1:  # Only if both classes are present
@@ -627,13 +660,14 @@ def find_optimal_threshold(model, val_loader, device):
             if f1 > best_f1:
                 best_f1 = f1
                 best_threshold = threshold
-    
+
     print(f"\nOptimal threshold found: {best_threshold:.4f} (F1 score: {best_f1:.4f})")
     return best_threshold
 
+
 def evaluate_model(model, test_loader, device, class_names, threshold=0.5):
     """Evaluate the model on test set using threshold-based prediction
-    
+
     Args:
         model: Trained model
         test_loader: DataLoader for test set
@@ -654,7 +688,7 @@ def evaluate_model(model, test_loader, device, class_names, threshold=0.5):
 
             outputs = model(batch_X)
             probs = torch.softmax(outputs, dim=1)
-            
+
             # Use threshold-based prediction instead of argmax for better minority class handling
             # For binary classification, use probability of positive class (class 1)
             pos_class_probs = probs[:, 1].cpu().numpy()
@@ -680,9 +714,10 @@ def evaluate_model(model, test_loader, device, class_names, threshold=0.5):
 
     return all_preds, all_labels, all_probs
 
+
 def analyze_transition_effectiveness(all_preds, all_labels, all_current_states, all_probs, class_names):
     """Analyze model effectiveness on state transitions (where current_state != future_state)
-    
+
     This function evaluates how well the model predicts future states when there is
     a state transition (i.e., when the state 50ms in the future is different from
     the current state at the end of the window).
@@ -692,68 +727,68 @@ def analyze_transition_effectiveness(all_preds, all_labels, all_current_states, 
     print("="*60)
     print(f"Analyzing predictions for points where future state ({PREDICTION_HORIZON_MS}ms) differs from current state")
     print("="*60)
-    
+
     # Identify transition cases (where current_state != future_state)
     transition_mask = all_current_states != all_labels
     n_transitions = np.sum(transition_mask)
     n_total = len(all_labels)
-    
+
     print(f"\nTransition Statistics:")
     print(f"  Total test samples: {n_total:,}")
     print(f"  Transition cases: {n_transitions:,} ({n_transitions/n_total*100:.2f}%)")
     print(f"  Non-transition cases: {n_total - n_transitions:,} ({(n_total - n_transitions)/n_total*100:.2f}%)")
-    
+
     if n_transitions == 0:
         print("\n  No transitions found in test set. Cannot perform transition analysis.")
         return
-    
+
     # Extract predictions and labels for transition cases only
     transition_preds = all_preds[transition_mask]
     transition_labels = all_labels[transition_mask]
     transition_probs = all_probs[transition_mask] if len(all_probs.shape) > 1 else None
-    
+
     # Calculate metrics for transition cases
     transition_acc = accuracy_score(transition_labels, transition_preds)
     transition_precision = precision_score(transition_labels, transition_preds, average='weighted', zero_division=0)
     transition_recall = recall_score(transition_labels, transition_preds, average='weighted', zero_division=0)
     transition_f1 = f1_score(transition_labels, transition_preds, average='weighted', zero_division=0)
-    
+
     print(f"\nTransition Case Metrics:")
     print(f"  Accuracy: {transition_acc:.4f}")
     print(f"  Precision (weighted): {transition_precision:.4f}")
     print(f"  Recall (weighted): {transition_recall:.4f}")
     print(f"  F1-Score (weighted): {transition_f1:.4f}")
-    
+
     # Calculate ROC AUC for transitions if binary
     if transition_probs is not None and len(np.unique(transition_labels)) > 1:
         transition_auc = roc_auc_score(transition_labels, transition_probs[:, 1])
         print(f"  ROC AUC: {transition_auc:.4f}")
-    
+
     # Detailed classification report for transitions
     print(f"\nTransition Case Classification Report:")
     print(classification_report(transition_labels, transition_preds, target_names=class_names, digits=4))
-    
+
     # Confusion matrix for transitions
     transition_cm = confusion_matrix(transition_labels, transition_preds)
     print(f"\nTransition Case Confusion Matrix:")
-    print(f"  Predicted →")
-    print(f"  Actual ↓")
+    print(f"  Predicted ->")
+    print(f"  Actual v")
     print(f"  {transition_cm}")
-    
+
     # Compare with overall performance
     overall_acc = accuracy_score(all_labels, all_preds)
     print(f"\nComparison with Overall Performance:")
     print(f"  Overall accuracy: {overall_acc:.4f}")
     print(f"  Transition accuracy: {transition_acc:.4f}")
     print(f"  Difference: {transition_acc - overall_acc:.4f} ({((transition_acc - overall_acc)/overall_acc*100):.2f}%)")
-    
+
     # Breakdown by transition type
     print(f"\nTransition Type Breakdown:")
     transition_types = {
-        'Suppressed → Dithering/ELMing/Mitigated': (all_current_states == 0) & (all_labels == 1),
-        'Dithering/ELMing/Mitigated → Suppressed': (all_current_states == 1) & (all_labels == 0)
+        'Suppressed -> Dithering/ELMing/Mitigated': (all_current_states == 0) & (all_labels == 1),
+        'Dithering/ELMing/Mitigated -> Suppressed': (all_current_states == 1) & (all_labels == 0)
     }
-    
+
     for trans_type, mask in transition_types.items():
         n_type = np.sum(mask)
         if n_type > 0:
@@ -761,8 +796,9 @@ def analyze_transition_effectiveness(all_preds, all_labels, all_current_states, 
             type_labels = all_labels[mask]
             type_acc = accuracy_score(type_labels, type_preds)
             print(f"  {trans_type}: {n_type:,} cases, Accuracy: {type_acc:.4f}")
-    
+
     print("="*60)
+
 
 def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_labels, class_names):
     """Plot training curves and confusion matrix"""
@@ -775,7 +811,7 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[0, 0].plot(val_losses, label='Val Loss', color='red')
     axes[0, 0].set_xlabel('Epoch')
     axes[0, 0].set_ylabel('Loss')
-    axes[0, 0].set_title(f'Training and Validation Loss ({PREDICTION_HORIZON_MS}ms Prediction - Binary)')
+    axes[0, 0].set_title(f'Training and Validation Loss ({PREDICTION_HORIZON_MS}ms Prediction - PatchTST Binary)')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
 
@@ -784,7 +820,7 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[0, 1].plot(val_accs, label='Val Accuracy', color='red')
     axes[0, 1].set_xlabel('Epoch')
     axes[0, 1].set_ylabel('Accuracy')
-    axes[0, 1].set_title(f'Training and Validation Accuracy ({PREDICTION_HORIZON_MS}ms Prediction - Binary)')
+    axes[0, 1].set_title(f'Training and Validation Accuracy ({PREDICTION_HORIZON_MS}ms Prediction - PatchTST Binary)')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
 
@@ -793,7 +829,7 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues',
                 xticklabels=class_names, yticklabels=class_names,
                 ax=axes[1, 0])
-    axes[1, 0].set_title('Normalized Confusion Matrix (Binary)')
+    axes[1, 0].set_title('Normalized Confusion Matrix (PatchTST Binary)')
     axes[1, 0].set_ylabel('True Label')
     axes[1, 0].set_xlabel('Predicted Label')
 
@@ -802,22 +838,23 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     sns.heatmap(cm_counts, annot=True, fmt='d', cmap='Blues',
                 xticklabels=class_names, yticklabels=class_names,
                 ax=axes[1, 1])
-    axes[1, 1].set_title('Confusion Matrix (Counts - Binary)')
+    axes[1, 1].set_title('Confusion Matrix (Counts - PatchTST Binary)')
     axes[1, 1].set_ylabel('True Label')
     axes[1, 1].set_xlabel('Predicted Label')
 
     plt.tight_layout()
-    plt.savefig(f'lstm_{PREDICTION_HORIZON_MS}ms_binary_transitions_results{VARIANT_SUFFIX}.png', dpi=300, bbox_inches='tight')
+    plt.savefig(f'patchtst_{PREDICTION_HORIZON_MS}ms_binary_transitions_results{VARIANT_SUFFIX}.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    print(f"Results saved to 'lstm_{PREDICTION_HORIZON_MS}ms_binary_transitions_results{VARIANT_SUFFIX}.png'")
+    print(f"Results saved to 'patchtst_{PREDICTION_HORIZON_MS}ms_binary_transitions_results{VARIANT_SUFFIX}.png'")
+
 
 def main():
     """Main training pipeline"""
     print("=" * 60)
-    print("LSTM-NN Model for Binary Plasma Classification")
+    print("PatchTST Model for Binary Plasma Classification")
     print("=" * 60)
-    print("Architecture: Unidirectional LSTM → NN → Classifier")
+    print("Architecture: Patching -> Channel-Independent Transformer -> Attn Pool -> Classifier")
     print("Window: 150 datapoints BEFORE current time")
     print(f"Prediction: {PREDICTION_HORIZON_MS}ms INTO THE FUTURE")
     print("Classification: Binary (Suppressed=0, Dithering/ELMing/Mitigated=1)")
@@ -857,15 +894,27 @@ def main():
     class_weights = total / (len(class_counts) * class_counts)
     # Normalize weights to sum to number of classes
     class_weights = class_weights / class_weights.sum() * len(class_weights)
-    
+
     print(f"Class distribution: {dict(zip(range(len(class_counts)), class_counts))}")
     print(f"Class weights: {dict(zip(range(len(class_weights)), class_weights))}")
-    
+
     # Convert to tensor and move to device
     class_weights_tensor = torch.FloatTensor(class_weights).to(device)
 
-    # Create model (binary classification: 2 classes)
-    model = LSTMFirstNN(n_features=len(features), n_classes=2).to(device)
+    # Create PatchTST model (binary classification: 2 classes)
+    model = PatchTST(
+        n_features=len(features),
+        n_classes=2,
+        seq_len=150,
+        patch_len=15,
+        stride=8,
+        d_model=128,
+        n_heads=8,
+        n_layers=3,
+        d_ff=256,
+        dropout=0.2,
+        head_dropout=0.3,
+    ).to(device)
 
     # Test forward pass speed
     print("\nTesting forward pass speed...")
@@ -887,7 +936,7 @@ def main():
 
     # Load best model
     print("\nLoading best model...")
-    model.load_state_dict(torch.load(f'best_lstm_50ms_binary_transitions{VARIANT_SUFFIX}.pth'))
+    model.load_state_dict(torch.load(f'best_patchtst_50ms_binary_transitions{VARIANT_SUFFIX}.pth'))
 
     # Find optimal threshold on validation set
     optimal_threshold = find_optimal_threshold(model, val_loader, device)
@@ -907,9 +956,9 @@ def main():
     print(f"\nFinal Test Accuracy: {test_acc:.4f}")
 
     print("\n" + "=" * 60)
-    print(f"Training Complete! (Predicting {PREDICTION_HORIZON_MS}ms into the future - Binary Classification)")
+    print(f"Training Complete! (Predicting {PREDICTION_HORIZON_MS}ms into the future - PatchTST Binary)")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
-

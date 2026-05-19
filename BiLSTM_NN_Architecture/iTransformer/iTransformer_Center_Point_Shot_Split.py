@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -19,56 +19,55 @@ torch.manual_seed(43)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(43)
 
-class LSTMFirstNN(nn.Module):
+class iTransformer(nn.Module):
     """
-    A hybrid model with LSTM processing FIRST (for temporal patterns)
-    followed by NN layers (for feature transformation).
-    This avoids the slow loop while preserving temporal structure.
-    """
-    def __init__(self, n_features, n_classes=4, lstm_hidden=128, nn_hidden_sizes=[256, 128]):
-        super(LSTMFirstNN, self).__init__()
+    iTransformer (Inverted Transformer) for plasma window classification.
 
-        # LSTM processes the raw temporal data FIRST
-        # This preserves temporal relationships efficiently
-        self.lstm = nn.LSTM(
-            input_size=n_features,  # Direct input of raw features
-            hidden_size=lstm_hidden,
-            num_layers=2,  # Deeper LSTM for better temporal learning
+    Unlike a vanilla Transformer that tokenizes each time step, the
+    iTransformer INVERTS the embedding: each variate's entire time series
+    is embedded into a single token. Self-attention is then applied ACROSS
+    variates (capturing multivariate correlations) while a feed-forward
+    network learns temporal representations within each variate token.
+
+    Reference: Liu et al., "iTransformer: Inverted Transformers Are
+    Effective for Time Series Forecasting", ICLR 2024.
+    """
+    def __init__(self, n_features, seq_len=150, n_classes=4,
+                 d_model=128, n_heads=8, n_layers=3, d_ff=256, dropout=0.2):
+        super(iTransformer, self).__init__()
+
+        self.n_features = n_features
+        self.seq_len = seq_len
+
+        # INVERTED EMBEDDING: map each variate's whole time series -> one token
+        # Input variate series of length seq_len -> token of dim d_model
+        self.variate_embedding = nn.Linear(seq_len, d_model)
+        self.embed_dropout = nn.Dropout(dropout)
+
+        # Transformer encoder: attention is computed OVER variate tokens.
+        # No positional encoding is used because variates have no inherent
+        # ordering (this is a defining choice of the iTransformer).
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation='gelu',
             batch_first=True,
-            bidirectional=True,  # Bidirectional for better temporal understanding
-            dropout=0.2
+            norm_first=True  # pre-norm for training stability
         )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.encoder_norm = nn.LayerNorm(d_model)
 
-        # After LSTM, we have temporal features
-        lstm_output_size = lstm_hidden * 2  # Bidirectional
-
-        # NN layers process the LSTM output
-        # No loops needed - we can process the entire LSTM output at once!
-        nn_layers = []
-        input_dim = lstm_output_size
-
-        for hidden_size in nn_hidden_sizes:
-            nn_layers.extend([
-                nn.Linear(input_dim, hidden_size),
-                nn.ReLU(),
-                nn.BatchNorm1d(hidden_size),
-                nn.Dropout(0.25)
-            ])
-            input_dim = hidden_size
-
-        self.nn_layers = nn.Sequential(*nn_layers)
-
-        # Feature aggregation from sequence
-        self.attention_weights = nn.Sequential(
-            nn.Linear(lstm_output_size, 1),
-            nn.Softmax(dim=1)
-        )
-
-        # Final classifier
+        # ROUND 4: keep flatten (preserves per-variate structure, unlike
+        # R2's pooling) but shrink + heavily regularize the head, since
+        # overfitting concentrates here (~36% of params) and the model
+        # overfits within ~1 epoch. 768->128 (was 768->256->128),
+        # head dropout 0.4.
         self.classifier = nn.Sequential(
-            nn.Linear(input_dim + lstm_output_size, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Linear(n_features * d_model, 128),
+            nn.GELU(),
+            nn.Dropout(0.4),
             nn.Linear(128, n_classes)
         )
 
@@ -77,51 +76,41 @@ class LSTMFirstNN(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
         # Count parameters by component
-        lstm_params = sum(p.numel() for name, p in self.named_parameters() if 'lstm' in name)
-        nn_params = sum(p.numel() for name, p in self.named_parameters() if 'nn_layers' in name)
-        attention_params = sum(p.numel() for name, p in self.named_parameters() if 'attention' in name)
+        embed_params = sum(p.numel() for name, p in self.named_parameters() if 'variate_embedding' in name)
+        encoder_params = sum(p.numel() for name, p in self.named_parameters() if 'encoder' in name)
         classifier_params = sum(p.numel() for name, p in self.named_parameters() if 'classifier' in name)
 
         print(f"\n{'='*60}")
-        print(f"LSTM-First-NN Model Parameter Count:")
+        print(f"iTransformer Model Parameter Count:")
         print(f"{'='*60}")
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
         print(f"\nParameters by component:")
-        print(f"  - LSTM layers: {lstm_params:,} ({lstm_params/total_params*100:.1f}%)")
-        print(f"  - NN layers: {nn_params:,} ({nn_params/total_params*100:.1f}%)")
-        print(f"  - Attention: {attention_params:,} ({attention_params/total_params*100:.1f}%)")
+        print(f"  - Inverted embedding: {embed_params:,} ({embed_params/total_params*100:.1f}%)")
+        print(f"  - Transformer encoder: {encoder_params:,} ({encoder_params/total_params*100:.1f}%)")
         print(f"  - Classifier: {classifier_params:,} ({classifier_params/total_params*100:.1f}%)")
         print(f"{'='*60}")
-        print(f"Architecture: LSTM → NN (no loops, preserves temporal structure)")
+        print(f"Architecture: Inverted embedding (variate->token) -> "
+              f"attention across {n_features} variates -> classifier")
 
     def forward(self, x):
         # x shape: (batch_size, n_features, sequence_length)
+        # This is ALREADY in the inverted layout: each variate is a row,
+        # so we embed along the time dimension directly.
         batch_size, n_features, seq_len = x.shape
 
-        # Transpose for LSTM: (batch_size, sequence_length, n_features)
-        x = x.transpose(1, 2)
+        # INVERTED EMBEDDING: each variate's series -> a token of dim d_model
+        # (batch_size, n_features, seq_len) -> (batch_size, n_features, d_model)
+        tokens = self.variate_embedding(x)
+        tokens = self.embed_dropout(tokens)
 
-        # STEP 1: LSTM processes the temporal sequence
-        lstm_output, (hidden, cell) = self.lstm(x)
-        # lstm_output shape: (batch_size, seq_len, lstm_hidden*2)
+        # Self-attention ACROSS the n_features variate tokens
+        encoded = self.encoder(tokens)            # (batch, n_features, d_model)
+        encoded = self.encoder_norm(encoded)
 
-        # STEP 2: Apply attention to aggregate temporal information
-        attention = self.attention_weights(lstm_output)  # (batch_size, seq_len, 1)
-        attended_features = torch.sum(lstm_output * attention, dim=1)  # (batch_size, lstm_hidden*2)
-
-        # STEP 3: Process the final LSTM hidden state through NN
-        # Take the last hidden state from both directions
-        final_hidden = lstm_output[:, -1, :]  # (batch_size, lstm_hidden*2)
-
-        # Process through NN layers (no loop needed!)
-        nn_features = self.nn_layers(final_hidden)  # (batch_size, nn_hidden[-1])
-
-        # STEP 4: Combine attended features with NN features
-        combined = torch.cat([nn_features, attended_features], dim=1)
-
-        # STEP 5: Final classification
-        output = self.classifier(combined)
+        # ROUND 3: flatten all variate tokens (restored from R1)
+        flat = encoded.reshape(batch_size, -1)    # (batch, n_features * d_model)
+        output = self.classifier(flat)
 
         return output
 
@@ -264,12 +253,26 @@ def create_windows_with_shot_split(X, y, shots, window_size=150, train_ratio=0.7
             val_windows, val_labels,
             test_windows, test_labels)
 
-def train_model(model, train_loader, val_loader, device, n_epochs=50):
+def train_model(model, train_loader, val_loader, device, n_epochs=50, class_weights=None):
     """Train the model"""
     # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5, verbose=True)
+    # ROUND 1: weighted loss (fights class imbalance) + label smoothing
+    # (fights overconfident wrong predictions / exploding val loss)
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    # ROUND 4: keep lr=1e-3; bump weight decay 1e-2->3e-2 (between R1's
+    # 1e-2 and R2's over-aggressive 5e-2) to slow the ~1-epoch overfit.
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=3e-2)
+    # ROUND 3: keep warmup+cosine but short warmup; trains fully at
+    # lr=1e-3 then anneals (R1's plateau let it overfit by epoch 7).
+    warmup_epochs = 3
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, n_epochs - warmup_epochs)
+        return 0.5 * (1.0 + np.cos(np.pi * progress))
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Training history
     train_losses, val_losses = [], []
@@ -277,7 +280,8 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
 
     best_val_acc = 0.0
     patience_counter = 0
-    max_patience = 10
+    # ROUND 2: more patience so warmup+cosine schedule can play out
+    max_patience = 15
 
     print("\nStarting training...")
     for epoch in range(n_epochs):
@@ -296,6 +300,8 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            # ROUND 1: gradient clipping for transformer training stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_loss += loss.item()
@@ -326,6 +332,8 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
         # Calculate metrics
         train_acc = accuracy_score(train_labels, train_preds)
         val_acc = accuracy_score(val_labels_list, val_preds)
+        # ROUND 1: macro-F1 is the true objective under heavy class imbalance
+        val_macro_f1 = f1_score(val_labels_list, val_preds, average='macro')
 
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
@@ -337,17 +345,17 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
 
         print(f"Epoch {epoch+1}/{n_epochs}")
         print(f"  Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        print(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}, Val Macro-F1: {val_macro_f1:.4f}")
 
-        # Learning rate scheduling
-        scheduler.step(val_acc)
+        # ROUND 2: warmup+cosine steps per-epoch (no metric arg)
+        scheduler.step()
 
-        # Early stopping
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_lstm_first_nn_shot_split.pth')
+        # Early stopping on macro-F1 (best_val_acc now tracks best macro-F1)
+        if val_macro_f1 > best_val_acc:
+            best_val_acc = val_macro_f1
+            torch.save(model.state_dict(), 'best_itransformer_shot_split.pth')
             patience_counter = 0
-            print(f"  ✓ New best model saved!")
+            print(f"  ✓ New best model saved! (macro-F1={val_macro_f1:.4f})")
         else:
             patience_counter += 1
 
@@ -439,19 +447,20 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[1, 1].set_xlabel('Predicted Label')
 
     plt.tight_layout()
-    plt.savefig('lstm_first_nn_shot_split_results.png', dpi=300, bbox_inches='tight')
+    plt.savefig('itransformer_shot_split_results.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    print("Results saved to 'lstm_first_nn_shot_split_results.png'")
+    print("Results saved to 'itransformer_shot_split_results.png'")
 
 import time
 
 def main():
     """Main training pipeline"""
     print("=" * 60)
-    print("LSTM-First NN Model for Plasma Classification")
+    print("iTransformer Model for Plasma Classification")
     print("=" * 60)
-    print("Architecture: LSTM processes temporal data → NN transforms features")
+    print("Architecture: Inverted embedding (each variate -> token) →")
+    print("              self-attention across variates → classifier")
     print("Split Method: SHOT-BASED (no data leakage between train/val/test)")
     print("=" * 60)
 
@@ -479,8 +488,30 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
+    # ROUND 1: balanced class weights to counter heavy class imbalance
+    cw = compute_class_weight('balanced', classes=np.array([0, 1, 2, 3]), y=train_y)
+    class_weights = torch.FloatTensor(cw)
+    print(f"\nClass weights (balanced): {dict(enumerate(np.round(cw, 4)))}")
+
+    # iTransformer hyperparameters
+    window_size = 150
+    d_model = 128
+    n_heads = 8
+    n_layers = 3
+    d_ff = 256
+    dropout = 0.2  # ROUND 3: reverted to 0.2 (R2's 0.3 contributed to underfit)
+
     # Create model
-    model = LSTMFirstNN(n_features=len(features), n_classes=4).to(device)
+    model = iTransformer(
+        n_features=len(features),
+        seq_len=window_size,
+        n_classes=4,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        d_ff=d_ff,
+        dropout=dropout
+    ).to(device)
 
     # Test forward pass speed
     print("\nTesting forward pass speed...")
@@ -493,18 +524,15 @@ def main():
     forward_time = time.time() - start_time
     print(f"Forward pass time for batch of {test_batch.shape[0]}: {forward_time:.3f} seconds")
 
-    if forward_time > 0.1:
-        print("  Note: Still fast! Much better than the loop-based approach (~0.9s)")
-
     # Train model
     print("\nStarting training...")
     train_losses, val_losses, train_accs, val_accs = train_model(
-        model, train_loader, val_loader, device, n_epochs=50
+        model, train_loader, val_loader, device, n_epochs=50, class_weights=class_weights
     )
 
     # Load best model
     print("\nLoading best model...")
-    model.load_state_dict(torch.load('best_lstm_first_nn_shot_split.pth'))
+    model.load_state_dict(torch.load('best_itransformer_shot_split.pth'))
 
     # Evaluate on test set
     class_names = ['Suppressed', 'Dithering', 'Mitigated', 'ELMing']
@@ -518,7 +546,7 @@ def main():
     print(f"\nFinal Test Accuracy: {test_acc:.4f}")
 
     # Save complete model checkpoint for later use
-    save_path = '/mnt/homes/sr4240/my_folder/BiLSTM_NN_Architecture/bilstm_nn_complete_model.pth'
+    save_path = '/mnt/homes/sr4240/my_folder/BiLSTM_NN_Architecture/iTransformer/itransformer_complete_model.pth'
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'scaler_mean': scaler.mean_,
@@ -526,9 +554,12 @@ def main():
         'features': features,
         'n_features': len(features),
         'n_classes': 4,
-        'lstm_hidden': 128,
-        'nn_hidden_sizes': [256, 128],
-        'window_size': 150,
+        'd_model': d_model,
+        'n_heads': n_heads,
+        'n_layers': n_layers,
+        'd_ff': d_ff,
+        'dropout': dropout,
+        'window_size': window_size,
         'class_names': class_names,
         'test_accuracy': test_acc
     }
@@ -536,9 +567,9 @@ def main():
     print(f"\n✓ Complete model checkpoint saved to: {save_path}")
     print("  Includes: model weights, scaler, features, label mappings")
 
-    # Also save as best_lstm_first_nn.pth
-    torch.save(checkpoint, 'best_lstm_first_nn.pth')
-    print(f"✓ Also saved to: best_lstm_first_nn.pth")
+    # Also save as best_itransformer.pth
+    torch.save(checkpoint, 'best_itransformer.pth')
+    print(f"✓ Also saved to: best_itransformer.pth")
 
     print("\n" + "=" * 60)
     print("Training Complete!")
@@ -547,4 +578,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

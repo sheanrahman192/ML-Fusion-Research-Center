@@ -14,36 +14,44 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Set random seeds for reproducibility
-np.random.seed(43)
-torch.manual_seed(43)
+np.random.seed(42)
+torch.manual_seed(42)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(43)
+    torch.cuda.manual_seed(42)
+
+# Prediction horizon in milliseconds
+PREDICTION_HORIZON_MS = 50
+
+# 3-state classification: Suppressed, Dithering/Mitigated (combined), ELMing
+N_CLASSES = 3
 
 class LSTMFirstNN(nn.Module):
     """
     A hybrid model with LSTM processing FIRST (for temporal patterns)
     followed by NN layers (for feature transformation).
-    This avoids the slow loop while preserving temporal structure.
+    Uses 150 datapoints BEFORE the classification point.
+    Predicts state 50ms into the future.
+    Unidirectional LSTM only (not bidirectional).
+    3-state classification: Suppressed, Dithering/Mitigated, ELMing.
     """
-    def __init__(self, n_features, n_classes=4, lstm_hidden=128, nn_hidden_sizes=[256, 128]):
+    def __init__(self, n_features, n_classes=3, lstm_hidden=64, nn_hidden_sizes=[128, 64]):
         super(LSTMFirstNN, self).__init__()
 
         # LSTM processes the raw temporal data FIRST
-        # This preserves temporal relationships efficiently
+        # Unidirectional for future prediction
         self.lstm = nn.LSTM(
             input_size=n_features,  # Direct input of raw features
             hidden_size=lstm_hidden,
             num_layers=2,  # Deeper LSTM for better temporal learning
             batch_first=True,
-            bidirectional=True,  # Bidirectional for better temporal understanding
-            dropout=0.2
+            bidirectional=False,  # Unidirectional for forward-in-time prediction
+            dropout=0.4
         )
 
         # After LSTM, we have temporal features
-        lstm_output_size = lstm_hidden * 2  # Bidirectional
+        lstm_output_size = lstm_hidden  # Unidirectional
 
         # NN layers process the LSTM output
-        # No loops needed - we can process the entire LSTM output at once!
         nn_layers = []
         input_dim = lstm_output_size
 
@@ -52,7 +60,7 @@ class LSTMFirstNN(nn.Module):
                 nn.Linear(input_dim, hidden_size),
                 nn.ReLU(),
                 nn.BatchNorm1d(hidden_size),
-                nn.Dropout(0.25)
+                nn.Dropout(0.45)
             ])
             input_dim = hidden_size
 
@@ -66,10 +74,10 @@ class LSTMFirstNN(nn.Module):
 
         # Final classifier
         self.classifier = nn.Sequential(
-            nn.Linear(input_dim + lstm_output_size, 128),
+            nn.Linear(input_dim + lstm_output_size, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, n_classes)
+            nn.Dropout(0.5),
+            nn.Linear(64, n_classes)
         )
 
         # Print detailed model size
@@ -83,7 +91,7 @@ class LSTMFirstNN(nn.Module):
         classifier_params = sum(p.numel() for name, p in self.named_parameters() if 'classifier' in name)
 
         print(f"\n{'='*60}")
-        print(f"LSTM-First-NN Model Parameter Count:")
+        print(f"LSTM-First-NN Model Parameter Count (3-state):")
         print(f"{'='*60}")
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
@@ -93,7 +101,7 @@ class LSTMFirstNN(nn.Module):
         print(f"  - Attention: {attention_params:,} ({attention_params/total_params*100:.1f}%)")
         print(f"  - Classifier: {classifier_params:,} ({classifier_params/total_params*100:.1f}%)")
         print(f"{'='*60}")
-        print(f"Architecture: LSTM → NN (no loops, preserves temporal structure)")
+        print(f"Architecture: LSTM (unidirectional) → NN → Classifier")
 
     def forward(self, x):
         # x shape: (batch_size, n_features, sequence_length)
@@ -104,17 +112,17 @@ class LSTMFirstNN(nn.Module):
 
         # STEP 1: LSTM processes the temporal sequence
         lstm_output, (hidden, cell) = self.lstm(x)
-        # lstm_output shape: (batch_size, seq_len, lstm_hidden*2)
+        # lstm_output shape: (batch_size, seq_len, lstm_hidden)
 
         # STEP 2: Apply attention to aggregate temporal information
         attention = self.attention_weights(lstm_output)  # (batch_size, seq_len, 1)
-        attended_features = torch.sum(lstm_output * attention, dim=1)  # (batch_size, lstm_hidden*2)
+        attended_features = torch.sum(lstm_output * attention, dim=1)  # (batch_size, lstm_hidden)
 
         # STEP 3: Process the final LSTM hidden state through NN
-        # Take the last hidden state from both directions
-        final_hidden = lstm_output[:, -1, :]  # (batch_size, lstm_hidden*2)
+        # Take the last hidden state (for future prediction)
+        final_hidden = lstm_output[:, -1, :]  # (batch_size, lstm_hidden)
 
-        # Process through NN layers (no loop needed!)
+        # Process through NN layers
         nn_features = self.nn_layers(final_hidden)  # (batch_size, nn_hidden[-1])
 
         # STEP 4: Combine attended features with NN features
@@ -138,8 +146,12 @@ class PlasmaDataset(Dataset):
         # Transpose to get (n_features, sequence_length) format
         return self.windows[idx].T, self.labels[idx]
 
+# Expected raw (4-state) distribution from Unpickle_and_Shots on plasma_data.csv
+# Used to verify we're loading the same data. 3-state combines 1+2 -> 1.
+EXPECTED_RAW_STATE_DISTRIBUTION = {0: 108627, 1: 16776, 2: 12515, 3: 71652}
+
 def load_and_prepare_data():
-    """Load and preprocess the plasma data"""
+    """Load and preprocess the plasma data - includes time column for future prediction"""
     print("Loading data...")
     df = pd.read_csv('/mnt/homes/sr4240/my_folder/plasma_data.csv')
 
@@ -147,7 +159,8 @@ def load_and_prepare_data():
     df = df[df['shot'] != 191675].copy()
 
     # Select only the specified 7 features
-    important_features = ['iln3iamp', 'betan', 'density', 'li', 'tritop', 'fs_sum_max_smoothed']
+    important_features = ['iln3iamp', 'betan', 'density', 'li',
+                         'tritop', 'fs_sum_past_max_smoothed']
     selected_features = [f for f in important_features if f in df.columns]
 
     print(f"Using {len(selected_features)} features: {selected_features}")
@@ -155,107 +168,156 @@ def load_and_prepare_data():
     # Sort by shot and time
     df_sorted = df.sort_values(['shot', 'time']).reset_index(drop=True)
 
-    # Valid labels are already 0-indexed:
-    # 0=Suppressed, 1=Dithering, 2=Mitigated, 3=ELMing. Exclude unknown values like -1.
-    valid_states = [0, 1, 2, 3]
-    df_filtered = df_sorted[df_sorted['state'].isin(valid_states)].copy()
+    # Keep ALL data (including state=0 and state=-1) for temporal context
+    # We'll filter invalid labels only when creating prediction targets
 
-    # Extract features and labels
-    X = df_filtered[selected_features].values
-    y = df_filtered['state'].values
-    shots = df_filtered['shot'].values
+    # Extract features, labels, times, and shots
+    X = df_sorted[selected_features].values
+    y = df_sorted['state'].values
+    times = df_sorted['time'].values  # Time in milliseconds
+    shots = df_sorted['shot'].values
 
-    # Remove NaN values
-    valid_mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+    # Remove NaN values (only rows with NaN in X, y, or times are dropped)
+    valid_mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y) & ~np.isnan(times)
     X = X[valid_mask]
     y = y[valid_mask]
+    times = times[valid_mask]
     shots = shots[valid_mask]
 
-    y = y.astype(int)
-
     print(f"Data shape after cleaning: {X.shape}")
-    print(f"Label distribution: {Counter(y)}")
+    actual_dist = dict(Counter(y))
+    print(f"Label distribution (raw 4-state): {Counter(y)}")
+    # Sanity check: loaded distribution should match reference (Unpickle_and_Shots)
+    if actual_dist != EXPECTED_RAW_STATE_DISTRIBUTION:
+        print(f"  Expected (reference): {EXPECTED_RAW_STATE_DISTRIBUTION}")
+        print("  Note: Difference can be from removing shot 191675 or NaN filtering.")
+    else:
+        print("  (Matches reference distribution from Unpickle_and_Shots.)")
 
     # Standardize features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    return X_scaled, y, shots, selected_features, scaler
+    return X_scaled, y, times, shots, selected_features, scaler
 
-def create_windows_for_shots(X, y, shots, shot_list, window_size=150):
-    """Create windows for a specific list of shots"""
-    windows, labels = [], []
-    center_idx = window_size // 2
+def create_windows_with_random_shot_split(X, y, times, shots, window_size=150, prediction_horizon_ms=50):
+    """Create windows and perform random split BY SHOT - predicting state at future time
 
-    for shot_id in shot_list:
+    3-state classification: 0=Suppressed, 1=Dithering/Mitigated (combined), 2=ELMing.
+    Raw states 1 (Dithering) and 2 (Mitigated) are mapped to class 1.
+    """
+    print(f"Creating windows of size {window_size} (predicting {prediction_horizon_ms}ms in the future)...")
+    print("Splitting by SHOT NUMBER (not individual data points)")
+    print("3-state labels: Suppressed=0, Dithering/Mitigated=1, ELMing=2")
+
+    # Get unique shots
+    unique_shots = np.unique(shots)
+    n_shots = len(unique_shots)
+    print(f"Total unique shots: {n_shots}")
+
+    # Randomly shuffle shots
+    np.random.seed(42)
+    shuffled_shots = np.random.permutation(unique_shots)
+
+    # Split shots into train/val/test (70/15/15)
+    train_size = int(0.7 * n_shots)
+    val_size = int(0.15 * n_shots)
+
+    train_shots = set(shuffled_shots[:train_size])
+    val_shots = set(shuffled_shots[train_size:train_size + val_size])
+    test_shots = set(shuffled_shots[train_size + val_size:])
+
+    print(f"Shot split: Train={len(train_shots)}, Val={len(val_shots)}, Test={len(test_shots)}")
+
+    # Create windows for each split
+    train_windows, train_labels = [], []
+    val_windows, val_labels = [], []
+    test_windows, test_labels = [], []
+
+    # 3-state label mapping: 0=Suppressed, 1=Dithering, 2=Mitigated, 3=ELMing (raw)
+    # -> 0=Suppressed, 1=Dithering/Mitigated, 2=ELMing
+    label_mapping = {0: 0, 1: 1, 2: 1, 3: 2}
+    valid_raw_labels = {0, 1, 2, 3}
+
+    # Track statistics
+    windows_created = 0
+    windows_skipped_no_future = 0
+    windows_skipped_invalid_label = 0
+
+    # Create windows per shot and assign to appropriate split
+    for shot_id in unique_shots:
         shot_mask = shots == shot_id
         shot_indices = np.where(shot_mask)[0]
 
         if len(shot_indices) < window_size:
             continue
 
+        # Determine which split this shot belongs to
+        if shot_id in train_shots:
+            target_windows = train_windows
+            target_labels = train_labels
+        elif shot_id in val_shots:
+            target_windows = val_windows
+            target_labels = val_labels
+        else:
+            target_windows = test_windows
+            target_labels = test_labels
+
+        # OPTIMIZATION: Extract shot data ONCE before the inner loop
+        shot_times = times[shot_indices]
+        shot_labels = y[shot_indices]
+        shot_X = X[shot_indices]
+
+        # Create windows for this shot
         for i in range(len(shot_indices) - window_size + 1):
-            start = shot_indices[i]
-            end = start + window_size
+            window = shot_X[i:i + window_size]
 
-            if end > shot_indices[-1] + 1:
-                break
+            # Get the time at the end of the window
+            window_end_time = shot_times[i + window_size - 1]
+            target_time = window_end_time + prediction_horizon_ms
 
-            window = X[start:end]
-            center_label = y[start + center_idx]
+            # OPTIMIZATION: Use binary search O(log n) instead of full array scan O(n)
+            future_local_idx = np.searchsorted(shot_times, target_time)
+
+            if future_local_idx >= len(shot_times):
+                # No future data available for this window
+                windows_skipped_no_future += 1
+                continue
+
+            # Get the label at the future time point
+            future_label = shot_labels[future_local_idx]
+
+            # Only create training example if target label is valid (0, 1, 2, 3)
+            # Skip state=-1 (uncertain from label propagation) and other invalid values
+            if int(future_label) not in valid_raw_labels:
+                windows_skipped_invalid_label += 1
+                continue
 
             # Check window validity
             if not np.isnan(window).any() and not np.isinf(window).any():
-                windows.append(window)
-                labels.append(center_label)
+                target_windows.append(window)
+                target_labels.append(label_mapping[int(future_label)])
+                windows_created += 1
 
-    if len(windows) == 0:
-        return np.array([]), np.array([])
+    # Convert to numpy arrays
+    train_windows = np.array(train_windows, dtype=np.float32)
+    train_labels = np.array(train_labels)
+    val_windows = np.array(val_windows, dtype=np.float32)
+    val_labels = np.array(val_labels)
+    test_windows = np.array(test_windows, dtype=np.float32)
+    test_labels = np.array(test_labels)
 
-    windows = np.array(windows, dtype=np.float32)
-    labels = np.array(labels)
+    print(f"\nWindow creation statistics:")
+    print(f"  Windows created: {windows_created:,}")
+    print(f"  Skipped (no future data): {windows_skipped_no_future:,}")
+    print(f"  Skipped (invalid label): {windows_skipped_invalid_label:,}")
 
-    return windows, labels
+    print(f"\nCreated windows:")
+    print(f"  Train: {len(train_windows)} windows from {len(train_shots)} shots")
+    print(f"  Val: {len(val_windows)} windows from {len(val_shots)} shots")
+    print(f"  Test: {len(test_windows)} windows from {len(test_shots)} shots")
 
-def create_windows_with_shot_split(X, y, shots, window_size=150, train_ratio=0.7, val_ratio=0.15):
-    """Create windows and perform shot-based split"""
-    print(f"Creating windows of size {window_size} with SHOT-BASED split...")
-
-    # Get unique shots
-    unique_shots = np.unique(shots)
-    n_shots = len(unique_shots)
-    print(f"Total number of unique shots: {n_shots}")
-
-    # Shuffle shots for random assignment
-    np.random.seed(42)
-    shuffled_shots = np.random.permutation(unique_shots)
-
-    # Calculate split indices
-    train_end = int(train_ratio * n_shots)
-    val_end = int((train_ratio + val_ratio) * n_shots)
-
-    # Split shots into train/val/test
-    train_shots = shuffled_shots[:train_end]
-    val_shots = shuffled_shots[train_end:val_end]
-    test_shots = shuffled_shots[val_end:]
-
-    print(f"\nShot split:")
-    print(f"  Train shots: {len(train_shots)}")
-    print(f"  Val shots: {len(val_shots)}")
-    print(f"  Test shots: {len(test_shots)}")
-
-    # Create windows for each split
-    print("\nCreating windows for each split...")
-    train_windows, train_labels = create_windows_for_shots(X, y, shots, train_shots, window_size)
-    val_windows, val_labels = create_windows_for_shots(X, y, shots, val_shots, window_size)
-    test_windows, test_labels = create_windows_for_shots(X, y, shots, test_shots, window_size)
-
-    print(f"\nWindows created:")
-    print(f"  Train: {len(train_windows)} windows")
-    print(f"  Val: {len(val_windows)} windows")
-    print(f"  Test: {len(test_windows)} windows")
-
-    print(f"\nLabel distributions:")
+    print(f"\nLabel distribution (3-state):")
     print(f"  Train: {Counter(train_labels)}")
     print(f"  Val: {Counter(val_labels)}")
     print(f"  Test: {Counter(test_labels)}")
@@ -279,7 +341,6 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
     patience_counter = 0
     max_patience = 10
 
-    print("\nStarting training...")
     for epoch in range(n_epochs):
         # Training phase
         model.train()
@@ -345,7 +406,7 @@ def train_model(model, train_loader, val_loader, device, n_epochs=50):
         # Early stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_lstm_first_nn_shot_split.pth')
+            torch.save(model.state_dict(), 'best_lstm_50ms_3state_random_shot.pth')
             patience_counter = 0
             print(f"  ✓ New best model saved!")
         else:
@@ -381,9 +442,13 @@ def evaluate_model(model, test_loader, device, class_names):
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
 
-    # Print classification report
-    print("\nClassification Report:")
-    print(classification_report(all_labels, all_preds, target_names=class_names, digits=4))
+    # Print classification report (3-state: labels 0, 1, 2)
+    print("\nClassification Report (3-state):")
+    print(classification_report(all_labels, all_preds, target_names=class_names, labels=[0, 1, 2], digits=4))
+
+    # Calculate and print test accuracy
+    test_acc = accuracy_score(all_labels, all_preds)
+    print(f"\nTest Accuracy: {test_acc:.4f}")
 
     # Calculate ROC AUC for each class
     print("\nROC AUC Scores:")
@@ -407,7 +472,7 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[0, 0].plot(val_losses, label='Val Loss', color='red')
     axes[0, 0].set_xlabel('Epoch')
     axes[0, 0].set_ylabel('Loss')
-    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].set_title(f'Training and Validation Loss ({PREDICTION_HORIZON_MS}ms, 3-state)')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
 
@@ -416,54 +481,59 @@ def plot_results(train_losses, val_losses, train_accs, val_accs, all_preds, all_
     axes[0, 1].plot(val_accs, label='Val Accuracy', color='red')
     axes[0, 1].set_xlabel('Epoch')
     axes[0, 1].set_ylabel('Accuracy')
-    axes[0, 1].set_title('Training and Validation Accuracy')
+    axes[0, 1].set_title(f'Training and Validation Accuracy ({PREDICTION_HORIZON_MS}ms, 3-state)')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
 
-    # Plot confusion matrix (normalized)
-    cm = confusion_matrix(all_labels, all_preds, normalize='true')
+    # Plot confusion matrix (normalized) - 3 classes
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2], normalize='true')
     sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues',
                 xticklabels=class_names, yticklabels=class_names,
                 ax=axes[1, 0])
-    axes[1, 0].set_title('Normalized Confusion Matrix')
+    axes[1, 0].set_title('Normalized Confusion Matrix (3-state)')
     axes[1, 0].set_ylabel('True Label')
     axes[1, 0].set_xlabel('Predicted Label')
 
-    # Plot confusion matrix (counts)
-    cm_counts = confusion_matrix(all_labels, all_preds)
+    # Plot confusion matrix (counts) - 3 classes
+    cm_counts = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2])
     sns.heatmap(cm_counts, annot=True, fmt='d', cmap='Blues',
                 xticklabels=class_names, yticklabels=class_names,
                 ax=axes[1, 1])
-    axes[1, 1].set_title('Confusion Matrix (Counts)')
+    axes[1, 1].set_title('Confusion Matrix (Counts, 3-state)')
     axes[1, 1].set_ylabel('True Label')
     axes[1, 1].set_xlabel('Predicted Label')
 
     plt.tight_layout()
-    plt.savefig('lstm_first_nn_shot_split_results.png', dpi=300, bbox_inches='tight')
+    plt.savefig(f'lstm_{PREDICTION_HORIZON_MS}ms_3_random_shot_results.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    print("Results saved to 'lstm_first_nn_shot_split_results.png'")
+    print(f"Results saved to 'lstm_{PREDICTION_HORIZON_MS}ms_3_random_shot_results.png'")
 
 import time
 
 def main():
-    """Main training pipeline"""
+    """Main training pipeline - 3-state classification (Suppressed, Dithering/Mitigated, ELMing)"""
     print("=" * 60)
-    print("LSTM-First NN Model for Plasma Classification")
+    print("LSTM-NN Model for Plasma Classification (3-state)")
     print("=" * 60)
-    print("Architecture: LSTM processes temporal data → NN transforms features")
-    print("Split Method: SHOT-BASED (no data leakage between train/val/test)")
+    print("Architecture: Unidirectional LSTM → NN → Classifier")
+    print("Window: 150 datapoints BEFORE current time")
+    print(f"Prediction: {PREDICTION_HORIZON_MS}ms INTO THE FUTURE")
+    print("Classes: Suppressed, Dithering/Mitigated (combined), ELMing")
+    print("Split: RANDOM BY SHOT NUMBER (not individual data points)")
     print("=" * 60)
 
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Load data
-    X, y, shots, features, scaler = load_and_prepare_data()
+    # Load data (now includes times)
+    X, y, times, shots, features, scaler = load_and_prepare_data()
 
-    # Create windows and split BY SHOT
-    train_X, train_y, val_X, val_y, test_X, test_y = create_windows_with_shot_split(X, y, shots)
+    # Create windows and split BY SHOT (3-state labels)
+    train_X, train_y, val_X, val_y, test_X, test_y = create_windows_with_random_shot_split(
+        X, y, times, shots, prediction_horizon_ms=PREDICTION_HORIZON_MS
+    )
 
     print(f"\nDataset sizes:")
     print(f"  Train: {len(train_X)} samples")
@@ -475,12 +545,12 @@ def main():
     val_dataset = PlasmaDataset(val_X, val_y)
     test_dataset = PlasmaDataset(test_X, test_y)
 
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=2048, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=2048, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=2048, shuffle=False)
 
-    # Create model
-    model = LSTMFirstNN(n_features=len(features), n_classes=4).to(device)
+    # Create model - 3 classes
+    model = LSTMFirstNN(n_features=len(features), n_classes=N_CLASSES).to(device)
 
     # Test forward pass speed
     print("\nTesting forward pass speed...")
@@ -493,9 +563,6 @@ def main():
     forward_time = time.time() - start_time
     print(f"Forward pass time for batch of {test_batch.shape[0]}: {forward_time:.3f} seconds")
 
-    if forward_time > 0.1:
-        print("  Note: Still fast! Much better than the loop-based approach (~0.9s)")
-
     # Train model
     print("\nStarting training...")
     train_losses, val_losses, train_accs, val_accs = train_model(
@@ -504,10 +571,10 @@ def main():
 
     # Load best model
     print("\nLoading best model...")
-    model.load_state_dict(torch.load('best_lstm_first_nn_shot_split.pth'))
+    model.load_state_dict(torch.load('best_lstm_50ms_3state_random_shot.pth'))
 
     # Evaluate on test set
-    class_names = ['Suppressed', 'Dithering', 'Mitigated', 'ELMing']
+    class_names = ['Suppressed', 'Dithering/Mitigated', 'ELMing']
     all_preds, all_labels, all_probs = evaluate_model(model, test_loader, device, class_names)
 
     # Plot results
@@ -517,34 +584,9 @@ def main():
     test_acc = accuracy_score(all_labels, all_preds)
     print(f"\nFinal Test Accuracy: {test_acc:.4f}")
 
-    # Save complete model checkpoint for later use
-    save_path = '/mnt/homes/sr4240/my_folder/BiLSTM_NN_Architecture/bilstm_nn_complete_model.pth'
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'scaler_mean': scaler.mean_,
-        'scaler_scale': scaler.scale_,
-        'features': features,
-        'n_features': len(features),
-        'n_classes': 4,
-        'lstm_hidden': 128,
-        'nn_hidden_sizes': [256, 128],
-        'window_size': 150,
-        'class_names': class_names,
-        'test_accuracy': test_acc
-    }
-    torch.save(checkpoint, save_path)
-    print(f"\n✓ Complete model checkpoint saved to: {save_path}")
-    print("  Includes: model weights, scaler, features, label mappings")
-
-    # Also save as best_lstm_first_nn.pth
-    torch.save(checkpoint, 'best_lstm_first_nn.pth')
-    print(f"✓ Also saved to: best_lstm_first_nn.pth")
-
     print("\n" + "=" * 60)
-    print("Training Complete!")
-    print("Note: Shot-based split ensures no data leakage between splits")
+    print(f"Training Complete! (3-state, predicting {PREDICTION_HORIZON_MS}ms into the future)")
     print("=" * 60)
 
 if __name__ == "__main__":
     main()
-
